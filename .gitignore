@@ -3,3 +3,6 @@ transcript-original--system-design.md
 
 # Local tooling output
 .playwright-mcp/
+
+# Pages build output
+_site/

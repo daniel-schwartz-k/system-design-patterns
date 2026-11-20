@@ -35,6 +35,10 @@ python3 -m http.server 8000
 # then visit http://localhost:8000
 ```
 
+## Publishing to GitHub Pages
+
+A workflow in [`.github/workflows/pages.yml`](.github/workflows/pages.yml) deploys the site on every push to `main` (or on demand from the Actions tab). One-time setup: in the repository go to **Settings → Pages** and set **Source** to **GitHub Actions**. The site will then be served at `https://<user>.github.io/system-design-patterns/`.
+
 ## Structure
 
 ```
@@ -42,6 +46,7 @@ index.html              landing page: overview, pattern cards, how to use it in 
 patterns/               one HTML page per pattern (same ten sections on every page)
 assets/style.css        design tokens (light/dark), layout and components
 assets/main.js          sidebar, "on this page" table of contents, theme toggle, prev/next links
+.github/workflows/      GitHub Pages deploy workflow
 ```
 
 Every pattern page has the same sections: TL;DR, the problem, when it comes up, solutions in escalation order, trade-offs and pitfalls, technology options, when not to use it, an interview script, deep-dive Q&A, and related patterns.
