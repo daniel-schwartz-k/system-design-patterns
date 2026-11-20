@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dealing with Contention — System Design Patterns</title>
+<meta name="description" content="What to do when many users change the same data at the same moment: atomic updates, locks, optimistic concurrency control, reservations, and the distributed options (locks, 2PC, sagas, queues).">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="03" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 03 of 08</span>
+  <h1>Dealing with Contention</h1>
+  <p class="lede">When many users try to change the same piece of data at the same instant, a naive read-check-write sequence lets two of them both win. Most of the time one database already has the tools to prevent that. The hard part comes when the data you must coordinate lives in more than one place.</p>
+  <div class="meta">
+    <span class="chip">Race conditions</span>
+    <span class="chip">Locking</span>
+    <span class="chip">Optimistic concurrency</span>
+    <span class="chip">Double booking</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p><strong>Contention</strong> means many actors competing to modify the same data at the same moment. The classic failure is a <strong>race condition</strong>: two servers both read "one ticket left", both decide it is theirs, and both sell it. Ticketmaster's last seat and Airbnb booking one property for the same night are the same problem. So are bidding on an auction item, matching a driver to a rider, and decrementing a stock counter.</p>
+  <p>The key insight: <strong>a single relational database already solves most of this</strong>. Escalate in this order and stop as soon as the problem is solved:</p>
+  <ol>
+    <li><strong>Atomic conditional write</strong>: make the check and the change one statement (<code>UPDATE ... WHERE status = 'available'</code>) and look at how many rows changed. Add unique constraints as a lock-free guard.</li>
+    <li><strong>Pessimistic locking</strong>: lock the row while you work on it (<code>SELECT ... FOR UPDATE</code>). Others wait.</li>
+    <li><strong>Optimistic concurrency control (OCC)</strong>: do not lock; write only if nobody changed the row since you read it (a version check), and retry if they did.</li>
+    <li><strong>Reservation with expiry</strong> for user-facing checkout flows: <code>available</code> to <code>held</code> (with <code>expires_at</code>) to <code>sold</code>.</li>
+    <li><strong>Only if the data truly spans several systems</strong>: distributed locks, two-phase commit, sagas, or serializing everything through a single queue per key.</li>
+  </ol>
+  <p>The warning from experienced interviewers: candidates get into trouble at step 5. The moment you split data across databases you take on every coordination problem the single database was solving for you, and the interviewer <em>will</em> ask how you handle it. <strong>Do not split (shard) prematurely; keep contended data together in one database.</strong></p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>The prompt involves a <strong>scarce, limited resource</strong>: last seat, last item, a single room, a single driver, a single username.</li>
+      <li>Words like "booking", "reservation", "bidding", "inventory", "matching", "claim", "flash sale", "limited quantity", "exactly once".</li>
+      <li>Two requests could touch the same row at nearly the same time, and the business rule is "never oversell / never double-book / highest bid wins".</li>
+      <li>An invariant has to hold across concurrent users (balance never negative, one winner, count never exceeds capacity).</li>
+      <li>The interviewer asks "what if two users click at the same moment?"</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>Imagine a ticket table. The naive purchase code looks perfectly reasonable:</p>
+<pre><code>-- Alice's server and Bob's server both run this
+ticket = SELECT * FROM tickets WHERE id = 7;      -- (1) read
+if ticket.status == 'available':                  -- (2) check
+    UPDATE tickets SET status = 'sold',           -- (3) write
+                       owner = :me
+    WHERE id = 7;</code></pre>
+  <p>The code is correct for one user at a time. With two users, the steps can interleave: both reads happen before either write. Each server sees "available", each passes the check, each writes. The second write silently overwrites the first, and one seat now has two buyers who both received a confirmation.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 310" role="img" aria-label="Sequence diagram of a race condition: Alice and Bob both read the ticket as available, then both write, so the ticket is sold twice">
+      <text class="t t-mid" x="110" y="24">Alice's server</text>
+      <text class="t t-mid" x="350" y="24">Database</text>
+      <text class="t t-mid" x="590" y="24">Bob's server</text>
+      <line class="l dash" x1="110" y1="36" x2="110" y2="296"/>
+      <line class="l dash" x1="350" y1="36" x2="350" y2="296"/>
+      <line class="l dash" x1="590" y1="36" x2="590" y2="296"/>
+
+      <line class="l-a" x1="112" y1="70" x2="346" y2="70" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="229" y="62">1. SELECT ticket 7</text>
+      <line class="l-a" x1="346" y1="94" x2="114" y2="94" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="229" y="112">status = available</text>
+
+      <line class="l-g" x1="588" y1="136" x2="354" y2="136" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="471" y="128">2. SELECT ticket 7</text>
+      <line class="l-g" x1="354" y1="160" x2="586" y2="160" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="471" y="178">status = available</text>
+
+      <line class="l-a" x1="112" y1="204" x2="346" y2="204" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="229" y="196">3. UPDATE owner = Alice</text>
+      <line class="l-g" x1="588" y1="230" x2="354" y2="230" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="471" y="222">4. UPDATE owner = Bob</text>
+
+      <rect class="n-b" x="170" y="256" width="360" height="30" rx="6"/>
+      <text class="t-b t-mid" x="350" y="276">Both writes succeed: one seat, two buyers</text>
+    </svg>
+    <figcaption>Read-check-write is not atomic. Both servers read before either one writes, so both believe the seat is theirs.</figcaption>
+  </figure>
+
+  <h3>Why it happens</h3>
+  <ul>
+    <li><strong>Check-then-act is not atomic.</strong> Between your read and your write, the world can change. The time window may be milliseconds, but at scale (or under a flash sale) you hit it constantly.</li>
+    <li><strong>Default isolation levels allow it.</strong> Most databases default to <em>read committed</em> (PostgreSQL, Oracle, SQL Server) or <em>repeatable read</em> (MySQL InnoDB). Under read committed, each statement sees the latest committed data, but nothing stops another transaction from committing a change between your <code>SELECT</code> and your <code>UPDATE</code>. A transaction by itself does not make a read-then-write safe.</li>
+    <li><strong>A lost update</strong> is the general form: two transactions read the same value, both compute a new value from it, and the last write wins, erasing the other's change. A counter that two clients both read as 10 and both set to 11 should have ended at 12.</li>
+    <li><strong>Several app servers make it worse.</strong> You cannot fix it with an in-process lock or <code>synchronized</code> block, because Alice and Bob are on different machines. The coordination must happen somewhere they both share: the database.</li>
+  </ul>
+
+  <div class="callout interview">
+    <span class="callout-title">Name the invariant</span>
+    <p>Start by stating the rule that must never break: "a seat is sold to at most one person", "an account balance never goes negative", "only the highest bid wins". Everything below is a way to enforce that invariant under concurrency, and picking the right tool depends on how it is shaped (single row, many rows, or many systems).</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>Any design with a scarce resource and concurrent actors. Typical prompts:</p>
+  <ul>
+    <li><strong>Ticketmaster / event booking</strong>: thousands of fans chase the same seats the moment sales open.</li>
+    <li><strong>Airbnb / hotel / restaurant reservations</strong>: one property, one night, many guests.</li>
+    <li><strong>Online auction / bidding</strong>: concurrent bids must resolve to one highest bid, in order.</li>
+    <li><strong>E-commerce flash sales / inventory</strong>: 100 units, 10,000 buyers; never sell 101.</li>
+    <li><strong>Ride-hailing and matching</strong>: one driver must not be assigned two riders.</li>
+    <li><strong>Payments and wallets</strong>: balance checks and transfers, double-spend prevention.</li>
+    <li><strong>Unique resources</strong>: usernames, coupon codes redeemed once, "first N users get a prize", seat assignment on a flight.</li>
+    <li><strong>Collaborative editing and config updates</strong>: two people edit the same document or record.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>Start with the cheapest tool that enforces your invariant. The first three steps live entirely inside one database, which is where you want to stay for as long as possible.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Reach for it when…</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Atomic conditional update / unique constraint</td><td>The rule fits in one statement on one row</td><td>Only covers what one statement can express</td></tr>
+        <tr><td>2</td><td>Pessimistic locking (<code>FOR UPDATE</code>)</td><td>Conflicts are likely, or the logic between read and write is complex</td><td>Waiting, deadlocks, held connections</td></tr>
+        <tr><td>3</td><td>Optimistic concurrency control</td><td>Conflicts are rare and you want no locks</td><td>Retries; bad under hot rows</td></tr>
+        <tr><td>3b</td><td>Reservation with expiry</td><td>A human holds a resource while paying</td><td>Expiry job, timeout tuning</td></tr>
+        <tr><td>4</td><td>Distributed lock</td><td>The resource spans systems with no shared database</td><td>Lease expiry, fencing, new failure modes</td></tr>
+        <tr><td>5</td><td>Two-phase commit</td><td>Atomic all-or-nothing across a few databases</td><td>Blocking coordinator, low availability</td></tr>
+        <tr><td>6</td><td>Saga</td><td>Long multi-service workflows</td><td>No isolation; compensations to design</td></tr>
+        <tr><td>7</td><td>Single queue / single writer per key</td><td>Extreme hot keys, strict ordering</td><td>Throughput cap per key, extra latency</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="step">Step 1</span>Atomic conditional update</h3>
+  <p>The simplest and most underrated fix: collapse the check and the write into <strong>one SQL statement</strong>, so the database evaluates the condition and applies the change as a single atomic operation. The database takes a row lock internally for the duration of that statement, so two concurrent statements on the same row are serialized automatically.</p>
+<pre><code>UPDATE tickets
+SET    status = 'sold', owner_id = :user
+WHERE  id = 7
+  AND  status = 'available';
+-- then check the rows-affected count from your driver:
+--   1  -> you got it
+--   0  -> someone else already did (or it never existed)</code></pre>
+  <p>Walk through the race: Alice's and Bob's statements arrive together. The database lets one proceed first; it flips the row to <code>sold</code> and commits. The other statement then re-evaluates its <code>WHERE</code> clause against the committed row (PostgreSQL does this re-check under read committed), finds <code>status = 'sold'</code>, matches nothing and reports 0 rows. Exactly one buyer wins, with no explicit locking code and no retry loop.</p>
+
+  <h4>Other single-statement guards</h4>
+  <ul>
+    <li><strong>Atomic increments and decrements with a floor:</strong> <code>UPDATE inventory SET qty = qty - 1 WHERE sku = 'X' AND qty &gt; 0;</code>. Never read the quantity into the app, subtract and write it back; that is the lost-update bug. Let the database do the arithmetic.</li>
+    <li><strong>Unique constraints:</strong> let the schema enforce "at most one". A <code>UNIQUE (event_id, seat_id)</code> index on a <code>bookings</code> table means a second <code>INSERT</code> for the same seat fails with a unique-violation error. No locks, and the guarantee holds no matter how many app servers or code paths write to the table.</li>
+    <li><strong><code>INSERT ... ON CONFLICT</code></strong> (PostgreSQL; <code>INSERT ... ON DUPLICATE KEY</code> in MySQL): claim-or-skip in one step, e.g. <code>INSERT INTO claims (coupon, user_id) VALUES (:c, :u) ON CONFLICT (coupon) DO NOTHING;</code> then check rows affected. This is also the standard way to build idempotent writes.</li>
+    <li><strong>CHECK constraints</strong> (<code>CHECK (qty &gt;= 0)</code>) act as a backstop: even a buggy code path cannot drive the value negative.</li>
+  </ul>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Simplest possible code; no transaction juggling</li>
+      <li>No waiting on locks held across network calls</li>
+      <li>Constraints enforce the rule for every writer, forever</li>
+      <li>Very fast: one round-trip</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Only works when the rule fits in one statement</li>
+      <li>Cannot span multiple rows or tables with arbitrary logic</li>
+      <li>You must remember to check rows-affected (ignoring it reintroduces the bug)</li>
+      <li>Does not help if the work between read and write involves other systems</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 2</span>Pessimistic locking</h3>
+  <p>If the logic between reading and writing is more than one statement (say, read the seat, read the user's credit, compute a price, then write), take a lock so nobody else can change the rows you are looking at until you finish. "Pessimistic" because it assumes a conflict <em>will</em> happen and prevents it up front.</p>
+<pre><code>BEGIN;
+SELECT * FROM tickets WHERE id = 7 FOR UPDATE;   -- row is now locked
+-- other transactions that try to lock or modify row 7 now WAIT here
+-- ... validate, compute, call other tables ...
+UPDATE tickets SET status = 'sold', owner_id = :user WHERE id = 7;
+COMMIT;                                           -- lock released</code></pre>
+  <p>With Alice holding the lock, Bob's <code>SELECT ... FOR UPDATE</code> blocks until Alice commits. When Bob finally gets the row, he reads the <em>committed</em> value (<code>sold</code>), sees it is gone, and rolls back cleanly. This is correct and easy to reason about.</p>
+
+  <h4>Lock flavours worth knowing</h4>
+  <ul>
+    <li><code>FOR UPDATE</code>: exclusive row lock; blocks other writers and other <code>FOR UPDATE</code> readers. Plain (non-locking) <code>SELECT</code>s are not blocked in MVCC databases like PostgreSQL and InnoDB.</li>
+    <li><code>FOR SHARE</code>: shared lock; many readers can hold it, but no one can modify the row.</li>
+    <li><code>NOWAIT</code>: fail immediately instead of waiting if the row is locked. Good for "try to grab it or tell the user it is busy".</li>
+    <li><code>SKIP LOCKED</code>: silently skip rows other transactions have locked. This is the standard trick for <strong>work queues in a database</strong>: <code>SELECT * FROM jobs WHERE status='pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;</code> lets many workers each claim a different job without blocking each other. Also useful to pick "any available seat" instead of a specific one.</li>
+    <li><strong>Table and advisory locks:</strong> coarse table locks exist but are rarely what you want. PostgreSQL <em>advisory locks</em> (<code>pg_advisory_xact_lock(key)</code>) let you lock an arbitrary application-defined key, such as "user 42's checkout", even when no single row represents it.</li>
+  </ul>
+
+  <h4>The costs: duration, deadlocks, convoys</h4>
+  <ul>
+    <li><strong>Lock duration.</strong> A lock is held from acquisition to commit. Keep transactions short: never call an external API, wait for a payment provider or wait for a human while holding row locks. Locks held across slow work make everyone else queue and can exhaust your connection pool.</li>
+    <li><strong>Deadlocks.</strong> Transaction A locks seat 1 then wants seat 2; transaction B locks seat 2 then wants seat 1; each waits on the other forever. Databases detect this (a wait-for graph cycle check) and abort one victim with a deadlock error, so your code must be ready to retry. Prevent most of them with <strong>consistent lock ordering</strong>: always acquire locks in a fixed order (for example, sorted by seat id) across all code paths.</li>
+    <li><strong>Lock convoys and queueing.</strong> A hot row means a growing line of waiters; throughput for that row is capped at one transaction at a time, and latency for the waiters grows with the line. Use lock timeouts (<code>lock_timeout</code>, <code>innodb_lock_wait_timeout</code>) so a stuck holder cannot stall everything.</li>
+    <li><strong>Scope.</strong> Locking too many rows (or a range, via gap locks in InnoDB) reduces concurrency for unrelated users. Lock the narrowest thing that protects the invariant.</li>
+  </ul>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Strong guarantee; easy to reason about</li>
+      <li>Handles complex multi-statement logic and multi-row updates</li>
+      <li>No retry logic needed for ordinary conflicts (waiting resolves them)</li>
+      <li>Good when conflicts are frequent: waiting beats thrashing</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Everyone on the hot row waits; throughput per row is serial</li>
+      <li>Deadlock risk; need lock ordering and retry on deadlock</li>
+      <li>Locks tie up connections; unsafe across user think-time</li>
+      <li>Only works inside one database; does not span services</li>
+    </ul></div>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-title">Which of the two first?</span>
+    <p>If one conditional <code>UPDATE</code> can express your rule, use it (Step 1): it is shorter and holds locks for the shortest possible time. Reach for <code>FOR UPDATE</code> when you genuinely need to read, think, and then write several rows under one consistent view.</p>
+  </div>
+
+
+  <h3><span class="step">Step 3</span>Optimistic concurrency control: why and how</h3>
+
+  <h4>Why it exists</h4>
+  <p>Pessimistic locking is safe but expensive, and the expense is paid <em>on every request</em>, whether or not anyone is actually competing:</p>
+  <ul>
+    <li><strong>Everyone waits.</strong> Even when two users touch the same row only once in a thousand requests, every request pays the cost of acquiring and releasing a lock.</li>
+    <li><strong>Locks span round-trips and think-time.</strong> In a web app the read and the write are often separate HTTP requests. A user may open a booking form, stare at it for five minutes, then press Submit. A lock held for that whole time blocks everyone else, and a user who closes the tab never releases it. Stateless HTTP servers and a pooled database connection make "hold a transaction open across requests" a non-starter.</li>
+    <li><strong>Deadlocks and lock convoys</strong> become possible, and lock waits reduce throughput and tie up connections.</li>
+    <li><strong>Often unnecessary.</strong> In many workloads (editing your own profile, updating a record that only a few people touch, booking from a large pool of mostly free seats) conflicts are <em>rare</em>. Paying for a lock every time to prevent something that almost never happens is wasteful.</li>
+  </ul>
+  <p><strong>Optimistic concurrency control (OCC)</strong> flips the assumption: <em>assume there will be no conflict, do the work with no locks, and detect a conflict only at write time.</em> If someone else changed the data in the meantime, your write is rejected and you start over (or tell the user). It is the same idea as compare-and-swap (CAS) in CPUs and lock-free data structures, applied to database rows.</p>
+
+  <div class="proscons">
+    <div class="pros"><h4>When OCC wins</h4><ul>
+      <li><strong>Low contention:</strong> conflicts are rare, so retries are rare</li>
+      <li><strong>Read-heavy workloads:</strong> readers never block or are blocked</li>
+      <li><strong>Long think times</strong> between read and write (forms, editors)</li>
+      <li><strong>Distributed or stateless clients</strong> and HTTP APIs: nothing is held between requests</li>
+      <li>No deadlocks, no lock timeouts, no abandoned locks</li>
+    </ul></div>
+    <div class="cons"><h4>When OCC loses</h4><ul>
+      <li><strong>High contention / hot rows:</strong> most attempts fail and must be redone</li>
+      <li><strong>Retry storms and livelock:</strong> many clients keep colliding and redoing the same work, burning CPU</li>
+      <li><strong>Starvation:</strong> an unlucky client can lose repeatedly while others win</li>
+      <li>Expensive work between read and write is wasted on every failed attempt</li>
+    </ul></div>
+  </div>
+
+  <h4>How it works, step by step</h4>
+  <p>Add a <strong>version</strong> to the row. Every successful write increments it. The whole technique is three phases:</p>
+  <ol>
+    <li><strong>Read.</strong> Fetch the row and remember its version (say, <code>v7</code>).</li>
+    <li><strong>Compute / validate.</strong> Do whatever business logic you need. No locks are held, so this can take as long as it wants (including user think-time).</li>
+    <li><strong>Write conditionally.</strong> Update only if the version is still what you read, and bump it in the same statement:
+<pre><code>UPDATE tickets
+SET    status = 'sold',
+       owner_id = $2,
+       version  = version + 1
+WHERE  id = $1
+  AND  version = $3;      -- the version I read earlier
+-- rows affected = 1: success, nobody changed it since I read it
+-- rows affected = 0: someone else wrote first -> conflict</code></pre>
+    </li>
+  </ol>
+  <p>On a conflict (0 rows) you either <strong>retry</strong>, which means re-reading the fresh row, re-running the validation and trying again, usually with <strong>exponential backoff plus random jitter</strong> and a <strong>maximum number of attempts</strong>, or you <strong>surface the conflict to the user</strong> (HTTP <code>409 Conflict</code>) and let them decide, which is the right answer for "someone else edited this record while you were looking at it".</p>
+
+  <h4>Worked example: Alice and Bob, the last ticket</h4>
+  <p>Ticket 7 is <code>status = 'available', version = 7</code>.</p>
+  <ol>
+    <li>Alice reads ticket 7: <code>available, v7</code>. Bob reads ticket 7: <code>available, v7</code>. Both see it is free; neither holds a lock.</li>
+    <li>Alice submits <code>UPDATE ... SET status='sold', owner=Alice, version=8 WHERE id=7 AND version=7</code>. The version is still 7, so the row changes. <strong>Rows affected = 1.</strong> Alice's purchase succeeds; the row is now <code>sold, v8</code>.</li>
+    <li>Bob submits the same statement with owner Bob and <code>WHERE ... version=7</code>. The row is now at version 8, so no row matches. <strong>Rows affected = 0.</strong> Bob has detected a conflict.</li>
+    <li>Bob re-reads the ticket: <code>sold, v8</code>. His validation ("is it available?") now fails.</li>
+    <li>Bob fails gracefully: the API returns <code>409 Conflict</code> / "Sorry, that seat was just taken", and the UI offers other seats. There is no double booking, and no one waited on a lock.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 740 440" role="img" aria-label="Sequence diagram of optimistic concurrency control: Alice and Bob both read version 7, Alice's conditional write succeeds, Bob's affects zero rows, Bob re-reads, sees sold at version 8, and fails gracefully">
+      <text class="t t-mid" x="110" y="24">Alice</text>
+      <text class="t t-mid" x="370" y="24">Database</text>
+      <text class="t t-mid" x="630" y="24">Bob</text>
+      <line class="l dash" x1="110" y1="36" x2="110" y2="430"/>
+      <line class="l dash" x1="370" y1="36" x2="370" y2="430"/>
+      <line class="l dash" x1="630" y1="36" x2="630" y2="430"/>
+
+      <line class="l-a" x1="112" y1="60" x2="366" y2="60" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="239" y="52">1. read ticket 7</text>
+      <line class="l-a" x1="366" y1="84" x2="114" y2="84" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="239" y="102">available, v7</text>
+
+      <line class="l-g" x1="628" y1="128" x2="374" y2="128" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="501" y="120">2. read ticket 7</text>
+      <line class="l-g" x1="374" y1="152" x2="626" y2="152" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="501" y="170">available, v7</text>
+
+      <line class="l-a" x1="112" y1="196" x2="366" y2="196" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="239" y="188">3. UPDATE ... WHERE version = 7</text>
+      <line class="l-g" x1="366" y1="220" x2="114" y2="220" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="239" y="238">rows = 1, now sold v8</text>
+
+      <line class="l-g" x1="628" y1="264" x2="374" y2="264" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="501" y="256">4. UPDATE ... WHERE version = 7</text>
+      <line class="l-b" x1="374" y1="288" x2="626" y2="288" marker-end="url(#arrow)"/>
+      <text class="t-b t-mid" x="501" y="306">rows = 0: conflict</text>
+
+      <line class="l-g" x1="628" y1="332" x2="374" y2="332" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="501" y="324">5. retry: re-read ticket 7</text>
+      <line class="l-g" x1="374" y1="356" x2="626" y2="356" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="501" y="374">sold, v8</text>
+
+      <rect class="n-w" x="505" y="388" width="230" height="30" rx="6"/>
+      <text class="t-s t-mid" x="620" y="408">Bob: 409, seat taken</text>
+    </svg>
+    <figcaption>Both clients read v7 with no locks. The conditional write lets exactly one through; the loser re-reads, sees the new state and fails gracefully.</figcaption>
+  </figure>
+
+  <h4>The retry loop</h4>
+<pre><code>import random, time
+
+MAX_ATTEMPTS = 5
+
+def buy_ticket(ticket_id, user_id):
+    for attempt in range(MAX_ATTEMPTS):
+        # 1. read (remember the version)
+        row = db.fetch_one(
+            "SELECT status, version FROM tickets WHERE id = %s", ticket_id)
+
+        # 2. validate / compute (no locks held)
+        if row.status != "available":
+            raise SoldOut()                 # a business answer, not a retry
+
+        # 3. conditional write: compare-and-swap on version
+        n = db.execute(
+            """UPDATE tickets
+               SET status='sold', owner_id=%s, version = version + 1
+               WHERE id=%s AND version=%s""",
+            user_id, ticket_id, row.version)
+
+        if n == 1:
+            return "ok"                     # we won
+
+        # n == 0: someone else changed the row; back off and redo everything
+        time.sleep(random.uniform(0, 0.05 * 2 ** attempt))   # backoff + jitter
+
+    raise Conflict()                        # surface as HTTP 409</code></pre>
+
+  <h4>Ways to implement the "version"</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>How it works</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Integer version column</td><td><code>version = version + 1</code> on every write; condition on <code>version = :read</code></td><td>The default. Monotonic, cheap, unambiguous. Used by JPA <code>@Version</code>, Rails <code>lock_version</code>, Hibernate.</td></tr>
+        <tr><td>Timestamp column</td><td><code>WHERE updated_at = :read</code></td><td>Works, but beware clock skew between servers and timestamp resolution: two updates in the same tick can look identical. Prefer a counter, or set the timestamp from the database.</td></tr>
+        <tr><td>Row hash / ETag</td><td>Hash of the row contents compared at write time</td><td>No schema change, but expensive to compute and cannot distinguish "changed then changed back".</td></tr>
+        <tr><td>Postgres <code>xmin</code></td><td>Hidden system column holding the id of the transaction that created the row version</td><td>Free version number in PostgreSQL; changes on every update. Not portable and not stable across dump/restore or <code>VACUUM FULL</code>.</td></tr>
+        <tr><td>Compare the value itself</td><td><code>WHERE status = 'available'</code> or <code>WHERE balance = :old</code></td><td>No extra column. Fine for state machines; subject to ABA (see pitfalls).</td></tr>
+        <tr><td>DynamoDB <code>ConditionExpression</code></td><td><code>attribute_not_exists(id)</code> or <code>version = :v</code> on <code>PutItem</code>/<code>UpdateItem</code></td><td>Failure is <code>ConditionalCheckFailedException</code>; the standard way to do OCC in DynamoDB.</td></tr>
+        <tr><td>MongoDB / Cosmos DB</td><td>Filter on a version field in <code>updateOne</code>, or Cosmos <code>_etag</code> with <code>If-Match</code></td><td>Check <code>matchedCount</code> / the 412 response.</td></tr>
+        <tr><td>HTTP <code>ETag</code> + <code>If-Match</code></td><td>Client sends the ETag it read; server returns <code>412 Precondition Failed</code> if it no longer matches (some APIs use 409)</td><td>OCC exposed at the API level so clients cannot clobber each other's edits.</td></tr>
+        <tr><td>Kubernetes <code>resourceVersion</code></td><td>Updates must carry the version they read; the API server rejects stale ones with 409</td><td>A well-known real-world example: controllers re-read and retry on conflict.</td></tr>
+        <tr><td>Git push</td><td>Push is rejected if the remote moved since your last fetch</td><td>Same idea: read, work offline, conditional publish, then rebase (retry).</td></tr>
+        <tr><td>Serializable / snapshot isolation</td><td>The database tracks reads and writes and aborts a transaction that would break serializability (PostgreSQL SSI, SQLSTATE <code>40001</code>)</td><td>OCC done by the engine for you. You must wrap the transaction in a retry loop for <code>40001</code> errors.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Pitfalls</h4>
+  <ul>
+    <li><strong>Retry the whole read-compute-write, not just the write.</strong> Re-sending the same <code>UPDATE ... WHERE version = 7</code> will fail forever. After a conflict you must re-read, re-validate against the new state (it may no longer be valid) and recompute.</li>
+    <li><strong>Side effects inside the retried section must be idempotent.</strong> If a retry attempt sends an email, charges a card or publishes an event before the conditional write, a retry repeats it. Do side effects only after the write succeeds, or use idempotency keys.</li>
+    <li><strong>The ABA problem.</strong> If you compare values instead of versions, a row can change from A to B and back to A; your check passes even though the data changed in between, which may matter (for example, a balance went 100, then 40, then 100 after a refund). A monotonically increasing version never repeats, so any intervening write is detected.</li>
+    <li><strong>The version bump must be in the same atomic statement</strong> as the data change. If you increment it in a separate statement, a gap appears in which another writer can slip through.</li>
+    <li><strong>A per-row version does not protect multi-row invariants (write skew).</strong> Two doctors are on call; each checks "at least one other doctor is on call" and each removes <em>themselves</em>. They update different rows, so neither version check fires, yet the invariant breaks. Fix with a constraint, serializable isolation, or by locking/versioning a shared parent row (for example, the shift row).</li>
+    <li><strong>Retry storms under hotspots.</strong> If hundreds of clients hammer one row, almost all attempts fail and every retry adds load. Use exponential backoff with jitter and an attempt cap, and when a specific path is persistently hot, switch that path to pessimistic locking, an atomic decrement, or queue serialization (Step 7).</li>
+    <li><strong>Return a useful conflict.</strong> Expose 409/412 with a message so the UI can show "this was changed by someone else, reload".</li>
+  </ul>
+
+  <h4>Choosing a technique: comparison</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>How it works</th><th>Best when</th><th>Costs / risk</th></tr></thead>
+      <tbody>
+        <tr><td>Pessimistic lock</td><td>Lock the row (<code>FOR UPDATE</code>) before reading; others wait</td><td>Conflicts are frequent, or multi-statement logic must see a stable view</td><td>Waiting, deadlocks, held connections; unsafe across user think-time</td></tr>
+        <tr><td>Optimistic (version check)</td><td>Read, compute, write only if the version is unchanged; retry on failure</td><td>Conflicts are rare; long think times; stateless HTTP clients</td><td>Retries; wasted work; storms on hot rows; must retry whole operation</td></tr>
+        <tr><td>Atomic conditional update</td><td>One statement checks and writes (<code>WHERE status='available'</code>, <code>qty = qty - 1</code>)</td><td>The rule fits in one statement on one row</td><td>Limited expressiveness; must check rows-affected</td></tr>
+        <tr><td>Distributed lock</td><td>Acquire a lease in Redis/ZooKeeper/etcd before touching the resource</td><td>Coordinating work across systems that share no database</td><td>Lease expiry, clock/GC pauses, needs fencing tokens; extra infrastructure</td></tr>
+        <tr><td>Single-writer queue</td><td>Route all operations for one key through one ordered consumer</td><td>Very hot keys, strict ordering, complex per-key logic</td><td>Per-key throughput cap, added latency, partition management</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout interview">
+    <span class="callout-title">If asked: why optimistic concurrency?</span>
+    <blockquote>"Locks make every request pay for a conflict that rarely happens, and they can't be held across a user's think-time or an HTTP round-trip without hurting throughput and risking deadlocks. With optimistic concurrency I read the row and its version, do my work without locks, and write with a compare-and-swap on the version. If zero rows were updated, someone beat me, so I re-read and retry with backoff, or return a 409. It's ideal when contention is low. If one row turns out to be hot, I'd switch that path to an atomic update or serialize it through a queue instead of letting clients thrash."</blockquote>
+  </div>
+
+  <h3>Isolation levels: the database's built-in safety net</h3>
+  <p>Instead of hand-writing locks and version checks, you can ask the database for stronger guarantees via the <strong>transaction isolation level</strong>. Know the ladder:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>What you see</th><th>Does it stop the double sell?</th></tr></thead>
+      <tbody>
+        <tr><td>Read committed</td><td>Each statement sees the latest committed data. Default in PostgreSQL, Oracle, SQL Server.</td><td>No: read-check-write still races, because the data can change between your statements.</td></tr>
+        <tr><td>Repeatable read / snapshot</td><td>The whole transaction sees one consistent snapshot. Default in MySQL InnoDB. In PostgreSQL, a write to a row that another transaction changed since your snapshot fails with a serialization error.</td><td>Partly: detects lost updates on the same row (PostgreSQL), but still allows write skew. InnoDB's behavior differs and is not a pure snapshot for writes, so check your database.</td></tr>
+        <tr><td>Serializable</td><td>The result is as if transactions ran one at a time. PostgreSQL implements it as Serializable Snapshot Isolation (SSI): optimistic tracking, no extra blocking; MySQL and SQL Server use locking.</td><td>Yes, including write skew, but any transaction may be aborted (SQLSTATE <code>40001</code>) and must be retried.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>Write skew</strong> example: two doctors are on call and the rule is "at least one must stay". Each transaction reads "2 on call", each removes itself, and both commit. They wrote different rows, so snapshot isolation sees no conflict, but the rule is broken. Only serializable isolation, a constraint, or explicitly locking a shared row catches it.</p>
+  <p>The pragmatic summary: serializable is the simplest to reason about (the database does optimistic control for you), at the price of more aborts and a mandatory retry loop. For a single hot invariant, a targeted conditional update or <code>FOR UPDATE</code> is usually cheaper and more predictable.</p>
+
+  <h3>Reservation with expiry (hold pattern)</h3>
+  <p>Checkout flows add a human to the loop: a fan picks a seat, then takes two minutes to enter card details. You cannot hold a database lock that long (see the OCC section), and you cannot just leave the seat "available" or someone else buys it while the first user is typing. The standard solution is a <strong>soft lock with a timeout</strong>, modelled as an explicit state:</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 700 200" role="img" aria-label="Ticket state machine: available moves to held when reserved, held moves to sold on payment, and held returns to available when the hold expires">
+      <rect class="n-g" x="20" y="40" width="140" height="56" rx="8"/><text class="t t-mid" x="90" y="73">available</text>
+      <rect class="n-w" x="280" y="40" width="140" height="56" rx="8"/><text class="t t-mid" x="350" y="73">held</text>
+      <rect class="n-g" x="540" y="40" width="140" height="56" rx="8"/><text class="t t-mid" x="610" y="73">sold</text>
+      <line class="l-a" x1="162" y1="68" x2="278" y2="68" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="220" y="58">reserve</text>
+      <line class="l-a" x1="422" y1="68" x2="538" y2="68" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="480" y="58">payment ok</text>
+      <path class="l dash" d="M350 98 V150 H90 V100" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="220" y="142">hold expires (expires_at passes)</text>
+      <text class="t-s" x="20" y="186">reserve = conditional UPDATE; sold = conditional UPDATE guarded by holder and expiry.</text>
+    </svg>
+    <figcaption>The hold pattern: the resource is exclusively reserved for a short window, then either sold or released.</figcaption>
+  </figure>
+<pre><code>-- 1. place a hold (atomic; only one request can win)
+UPDATE tickets
+SET    status = 'held', held_by = :user, expires_at = now() + interval '5 minutes'
+WHERE  id = 7
+  AND (status = 'available' OR (status = 'held' AND expires_at &lt; now()));
+
+-- 2. on successful payment (must still be MY unexpired hold)
+UPDATE tickets
+SET    status = 'sold', owner_id = :user
+WHERE  id = 7 AND status = 'held' AND held_by = :user AND expires_at &gt; now();</code></pre>
+  <ul>
+    <li><strong>Expiry options:</strong> (a) a background job that periodically flips expired holds back to <code>available</code>; (b) make expiry implicit by including <code>expires_at &lt; now()</code> in the availability condition, as above, so nothing needs to clean up for correctness; (c) store the hold in Redis with a TTL (<code>SET hold:7 user NX EX 300</code>) and treat the key's absence as "available". With Redis, the database only records the final <code>sold</code>, which must still be a conditional write, because the Redis hold alone is not a durable guarantee.</li>
+    <li><strong>Choose the timeout carefully:</strong> long enough to pay, short enough that abandoned carts do not starve real buyers (Ticketmaster-style systems commonly hold for several minutes; treat any number you quote as an example).</li>
+    <li><strong>Check at both ends:</strong> the payment step must verify the hold is still yours and unexpired; otherwise a slow payment could finalize a seat that was already re-sold.</li>
+    <li><strong>Payment races:</strong> if the payment succeeds after the hold expired and the seat was resold, you need a refund path. Keep the hold a bit longer than the payment timeout to make this rare.</li>
+    <li>Everything here is still a single-database conditional write (Step 1), just with a richer state machine.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-title">Don't split prematurely</span>
+    <p>Everything above works inside one database. A single well-provisioned PostgreSQL or MySQL instance handles thousands of such transactions per second, and contended data (seats for an event, inventory for a sku) is usually small. If you shard the data across databases, you lose cross-row transactions and row locks, and every operation that touches two shards now needs the distributed coordination below. <strong>Keep the contended data together</strong>; scale by sharding on a key (for example, event id) so that all rows that must be coordinated still live in one shard, and use read replicas and caches for the non-contended read traffic.</p>
+  </div>
+
+  <h3><span class="step">Step 4</span>Beyond one database: distributed locks</h3>
+  <p>Sometimes the thing you must protect is not a row in a single database: a resource shared by several services, a job that must run on exactly one worker, or data in a store with no transactions. A <strong>distributed lock</strong> is a lock whose state lives in a shared service that all participants can reach.</p>
+  <ul>
+    <li><strong>Redis:</strong> <code>SET lock:seat:7 &lt;random-token&gt; NX PX 30000</code> (set only if absent, expire after 30 s). Release only if the stored token matches yours (a small Lua script does compare-and-delete atomically) so you never delete someone else's lock. The expiry is a <strong>lease</strong>: it makes sure a crashed holder cannot hold the lock forever.</li>
+    <li><strong>ZooKeeper / etcd (Chubby-style):</strong> locks built on a consensus-backed store, using ephemeral nodes or leases tied to a session. Stronger guarantees than a single Redis node, at the cost of running a quorum.</li>
+    <li><strong>Redlock</strong> is an algorithm that acquires the same lock on a majority of independent Redis nodes. It is controversial: critics (notably Martin Kleppmann) argue it depends on timing assumptions (bounded clock drift and pauses) that do not hold in real systems, so it is unsafe when correctness, not just efficiency, depends on the lock. Defenders disagree. The safe takeaway: use a Redis lock for efficiency (avoid duplicate work), and use a consensus system plus fencing when mutual exclusion is critical.</li>
+  </ul>
+
+  <h4>The core danger: lease expiry and pauses</h4>
+  <p>The holder acquires a 30-second lease, then stalls (a long garbage-collection pause, a network partition, a busy VM) for longer than the lease. The lease expires, a second client acquires the lock, and then the first client wakes up, still <em>believing</em> it holds the lock, and writes. Now two writers act "exclusively" at once. A lock with a timeout alone cannot prevent this, because the holder cannot know it lost the lock.</p>
+
+  <h4>Fencing tokens</h4>
+  <p>The fix is to make the <strong>resource itself</strong> reject stale holders. The lock service hands out a monotonically increasing number with each grant (token 33, then 34, and so on). The client sends the token along with every write, and the storage layer remembers the highest token it has seen and rejects any write with a lower one. When the paused client wakes up and sends token 33 after 34 has been used, the write is refused. Notice this is again optimistic concurrency control: a version check at the data store. ZooKeeper (<code>zxid</code> / node version) and etcd (revision) provide such monotonic numbers; a plain Redis lock does not.</p>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Works across services and datastores with no shared transaction</li>
+      <li>Good for "only one worker does this job" and leader election</li>
+      <li>Redis locks are quick to set up and low latency</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>New failure modes: expiry, pauses, partitions, clock drift</li>
+      <li>Needs fencing for real safety, and the data store must cooperate</li>
+      <li>Extra infrastructure on the critical path; the lock service becomes a bottleneck and a dependency</li>
+      <li>Easy to get subtly wrong; interviewers will probe it</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 5</span>Two-phase commit (2PC)</h3>
+  <p>When one logical operation must update several databases atomically (all commit or none), 2PC provides it. A <strong>coordinator</strong> runs two phases: in the <em>prepare</em> phase it asks every participant "can you commit?", and each participant durably logs the change, takes its locks, and votes yes or no; in the <em>commit</em> phase, if everyone voted yes the coordinator tells all to commit, otherwise it tells all to abort. It gives atomicity across databases (the XA standard, and what Spanner and distributed SQL systems do internally).</p>
+  <p><strong>Why it hurts:</strong> it is a <em>blocking</em> protocol. After voting yes, a participant holds its locks and cannot decide alone; if the coordinator crashes before announcing the outcome, participants are stuck "in doubt" holding locks until it recovers. It also adds round-trips, so latency is the sum of the slowest participants, and availability drops because every participant must be up. In interviews, mention it exists and why you avoid it across services; prefer keeping the data in one database or using a saga.</p>
+
+  <h3><span class="step">Step 6</span>Saga</h3>
+  <p>A <strong>saga</strong> replaces one big distributed transaction with a sequence of <em>local</em> transactions, one per service, each with a <strong>compensating action</strong> that semantically undoes it. Book flight, then book hotel, then charge the card; if charging fails, run "cancel hotel" and "cancel flight". There are no cross-service locks, so it stays available and fast, but there is no isolation: other requests can see the intermediate states, so you design for it (for example, with the hold pattern above). Sagas are coordinated either by an orchestrator or by events (choreography). The mechanics, failure handling, idempotency and orchestration engines such as Temporal and Step Functions get a full deep dive in <a href="07-multi-step-processes.html">07 · Multi-Step Processes</a>.</p>
+
+  <h3><span class="step">Step 7</span>Serialize through a single queue (single writer per key)</h3>
+  <p>If you cannot tolerate contention at all, remove concurrency instead of managing it: route every operation on a given entity through <strong>one ordered consumer</strong>, so operations on that entity run one at a time. No two writers ever race, so no locks or version checks are needed for that entity.</p>
+  <ul>
+    <li><strong>Partition by entity id.</strong> Use a message log such as Kafka and key messages by <code>seat_id</code> or <code>auction_id</code>. All messages with one key land in the same partition, which is consumed in order by exactly one consumer in a group. Different keys are processed in parallel across partitions, so throughput scales with the number of partitions.</li>
+    <li><strong>The actor model</strong> (Akka, Orleans, Erlang/Elixir processes) is the same idea in memory: each entity is an actor with a mailbox, and it processes one message at a time.</li>
+    <li><strong>Bidding example:</strong> every bid for an auction goes to that auction's partition; the single consumer checks "is this higher than the current best?" and applies it. Order is the arrival order in the partition.</li>
+  </ul>
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Eliminates races for a key; simple per-key logic</li>
+      <li>Natural ordering and audit trail</li>
+      <li>Handles extreme hot keys without retry storms</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Throughput for one key is capped at one consumer</li>
+      <li>Asynchronous: the user gets an answer later (status polling or push)</li>
+      <li>Consumer failover must be handled; hot partitions and rebalancing complicate it</li>
+      <li>More moving parts than a conditional <code>UPDATE</code></li>
+    </ul></div>
+  </div>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>This is where interviews are won. Every contention technique trades one cost for another; be ready to say which.</p>
+
+  <h3>Correctness versus throughput</h3>
+  <p>The stronger the guarantee, the less parallelism you get. Locks and queues serialize access to a hot key; optimistic control keeps parallelism but wastes work when it guesses wrong. Pick by contention level: low contention favors optimistic, high contention on a few rows favors pessimistic, atomic updates or queues.</p>
+
+  <h3>Hot rows</h3>
+  <p>One row everyone wants (the last ticket, a viral item's stock counter) limits throughput regardless of technique, because updates to a single row are inherently serial. Options: use atomic decrements (shortest possible lock time), split a counter into N sub-counters or "buckets" and sum them, pre-allocate inventory slices per server, or shed load early with a queue or waiting room so only a controlled number of attempts reach the database.</p>
+
+  <h3>Deadlocks</h3>
+  <p>Acquire locks in a consistent global order, keep transactions short, set lock timeouts, and always be ready to retry a transaction the database aborted as a deadlock victim.</p>
+
+  <h3>Retry storms and livelock</h3>
+  <p>Optimistic loops multiply load exactly when the system is struggling. Use exponential backoff with jitter, a bounded attempt count, and consider a circuit breaker or switching the hot path to a different strategy.</p>
+
+  <h3>Idempotency</h3>
+  <p>Clients retry on timeouts, and you may retry on conflicts. Give each purchase attempt an <strong>idempotency key</strong> (stored with a unique constraint) so a repeated request returns the original result instead of buying twice.</p>
+
+  <h3>Fairness and user experience</h3>
+  <p>When 100,000 fans chase 5,000 seats, correctness is the easy part; the experience is not. Consider a virtual waiting room that admits users at a controlled rate, and tell losers fast and clearly instead of letting them spin.</p>
+
+  <h3>Cross-system coordination is costly</h3>
+  <p>Every step beyond one database adds failure modes (lease expiry, in-doubt participants, missing isolation). Prefer a design where the contended invariant lives in one place, and use sagas, outbox patterns and idempotent consumers for the rest.</p>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Options</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Transactional database</td><td>PostgreSQL, MySQL (InnoDB), Amazon Aurora, SQL Server, Oracle, CockroachDB, Spanner</td><td>Row locks, <code>FOR UPDATE</code> / <code>SKIP LOCKED</code>, unique constraints, configurable isolation. PostgreSQL offers SSI for serializable. Distributed SQL (CockroachDB, Spanner) gives cross-node transactions at higher latency.</td></tr>
+        <tr><td>Conditional writes in NoSQL</td><td>DynamoDB (<code>ConditionExpression</code>, transactions), MongoDB (filtered <code>updateOne</code>, transactions), Cassandra (lightweight transactions)</td><td>DynamoDB conditional writes are the standard OCC tool. Cassandra LWTs use Paxos and are much slower than normal writes.</td></tr>
+        <tr><td>Fast holds and counters</td><td>Redis (<code>SET NX EX</code>, <code>INCR</code>, Lua scripts), Valkey</td><td>Good for TTL-based holds, rate limits and atomic counters. A Redis lock alone is not a correctness guarantee without fencing.</td></tr>
+        <tr><td>Coordination services</td><td>ZooKeeper, etcd, Consul</td><td>Consensus-backed locks, leader election, monotonic revisions usable as fencing tokens.</td></tr>
+        <tr><td>Serialization</td><td>Kafka, Amazon SQS FIFO (message groups), Pulsar, Akka / Orleans actors</td><td>Key by entity id for single-writer-per-key semantics; scale by partition count.</td></tr>
+        <tr><td>Workflow / saga engines</td><td>Temporal, AWS Step Functions, Camunda, Netflix Conductor</td><td>See <a href="07-multi-step-processes.html">Multi-Step Processes</a>.</td></tr>
+        <tr><td>Optimistic APIs</td><td>HTTP <code>ETag</code> / <code>If-Match</code>, Kubernetes <code>resourceVersion</code>, JPA <code>@Version</code></td><td>OCC exposed to clients so concurrent editors cannot overwrite each other silently.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <ul>
+    <li><strong>Don't add coordination where there is no contention.</strong> If each user only edits their own data, there is nothing to race on. A distributed lock around a per-user update is pure overhead.</li>
+    <li><strong>Don't reach for distributed locks, 2PC or sagas when one database will do.</strong> The fix for most contention is a conditional update or <code>FOR UPDATE</code> in the database you already have. Splitting data first, then coordinating, creates the problem you were trying to avoid.</li>
+    <li><strong>Don't use optimistic control on a hot row.</strong> If most attempts will collide, you get retry storms. Use an atomic update, a pessimistic lock or a queue there.</li>
+    <li><strong>Don't hold locks across user think-time or external calls.</strong> Use OCC or a hold-with-expiry instead.</li>
+    <li><strong>Don't use a lock service as a correctness guarantee</strong> unless it is paired with fencing at the resource.</li>
+    <li><strong>The real problem is write volume, not conflicts.</strong> If writes are to many different rows and the database simply cannot keep up, that is <a href="02-scaling-writes.html">Scaling Writes</a>, not contention.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"The risk here is a race condition: two buyers both read that one seat is left and both buy it. The invariant is that a seat is sold at most once. I'd keep ticket state in a single relational database and enforce that with an atomic conditional update: <code>UPDATE tickets SET status='sold' WHERE id=? AND status='available'</code>, checking rows affected. Because users spend minutes in checkout, I'd model a hold: available, held with an expiry, then sold, so no lock is held across user think-time. Where logic spans several rows I'd use <code>SELECT FOR UPDATE</code> with consistent lock ordering, or optimistic concurrency with a version column and retry with backoff if conflicts are rare. I would deliberately not shard the contended data prematurely, since that pushes me toward distributed locks, two-phase commit or sagas. If a single item becomes extremely hot, I'd put a queue in front of it keyed by item id so one consumer serializes the writes, and I'd add idempotency keys so client retries never double-buy."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>Why isn't wrapping the read and write in a transaction enough?</summary>
+    <div class="answer">
+      <p>Under the default read committed level, a transaction only guarantees that each statement sees committed data. Another transaction can commit a change to the same row between your <code>SELECT</code> and your <code>UPDATE</code>, so your decision was made on stale information. You need the check and write to be atomic (a conditional <code>UPDATE</code>), a lock on the row (<code>FOR UPDATE</code>), a version check, or serializable isolation with a retry loop.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Optimistic versus pessimistic: how do you choose, and what happens if you pick wrong?</summary>
+    <div class="answer">
+      <p>Estimate how often two requests hit the same row. If conflicts are rare, or users hold data a long time before submitting, use optimistic control: no locks, a retry or 409 on the rare collision. If conflicts are common or the work between read and write is costly to redo, use pessimistic locking so waiting replaces thrashing. Pick optimistic on a hot row and you get retry storms, wasted work and starvation; pick pessimistic for a form with long think-time and you get blocked users, tied-up connections and abandoned locks. You can mix: optimistic for the general path, an atomic update or lock for the known hot path.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Walk me through optimistic concurrency control. What exactly happens when two users edit the same row?</summary>
+    <div class="answer">
+      <p>Both read the row and see version 7. Each computes their change with no locks. The first to write runs <code>UPDATE ... SET ..., version = version + 1 WHERE id = ? AND version = 7</code>; one row is affected and the version becomes 8. The second runs the identical statement, but the row is at version 8, so zero rows match: a detected conflict. That client must redo the <em>whole</em> read-compute-write (re-read to see version 8, re-validate, recompute) with backoff and jitter and an attempt cap, or return 409 to the user. Pitfalls: bump the version in the same statement; retry the whole operation, not just the write; keep side effects idempotent; remember a per-row version does not guard multi-row invariants (write skew); and prefer a monotonic version over comparing values to avoid ABA.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Why can't I just use a Redis lock to protect the seat?</summary>
+    <div class="answer">
+      <p>You can for efficiency, but not as the only correctness guarantee. A Redis lock has a lease; if the holder pauses (GC, network, VM stall) past the lease, the lock expires, a second client acquires it, and then the first resumes and writes, so two clients act as the exclusive owner. Safety requires a fencing token checked by the data store, which is really an optimistic version check on the resource. If the seat is already in a database, a conditional update there is simpler and strictly safer, and the Redis layer is better used for short holds with TTL or as a fast pre-filter.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you handle a flash sale where 100,000 users want 1,000 items?</summary>
+    <div class="answer">
+      <p>Expect a very hot row. Use atomic decrements (<code>qty = qty - 1 WHERE qty &gt; 0</code>), which hold locks for the shortest possible time, or split inventory into buckets to spread the contention. Protect the database with a virtual waiting room or a queue that admits users at a controlled rate, reject quickly once stock hits zero (a cached "sold out" flag avoids touching the database), use holds with short expiry for checkout, and add idempotency keys. If a single key still saturates, serialize it through a partitioned queue keyed by item id.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Two-phase commit versus saga: when would you choose each?</summary>
+    <div class="answer">
+      <p>2PC gives atomic all-or-nothing and isolation across a small number of tightly controlled databases, but it blocks if the coordinator fails and hurts availability and latency; it is rare across independently owned services. A saga gives availability and loose coupling by running local transactions and undoing them with compensations, but offers no isolation, so intermediate states are visible and compensations must be idempotent and designed carefully. For microservice workflows choose sagas; if the data can be kept in one database, avoid both and use a plain transaction. See <a href="07-multi-step-processes.html">Multi-Step Processes</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="02-scaling-writes.html">02 · Scaling Writes</a></li>
+    <li><a href="05-long-running-tasks.html">05 · Long-Running Tasks</a></li>
+    <li><a href="07-multi-step-processes.html">07 · Multi-Step Processes (saga deep dive)</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Step Processes — System Design Patterns</title>
+<meta name="description" content="How to coordinate work that spans several services, humans and days: hand-rolled state machines, the saga pattern, and durable workflow engines like Temporal and AWS Step Functions.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="07" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 07 of 08</span>
+  <h1>Multi-Step Processes</h1>
+  <p class="lede">One user click can trigger a chain of work across several services, third-party APIs and even a human in a warehouse, lasting hours or days. No single database transaction can cover that, so you need a way to make the whole chain survive crashes, retries and partial failures.</p>
+  <div class="meta">
+    <span class="chip">Saga</span>
+    <span class="chip">Workflow engines</span>
+    <span class="chip">Idempotency</span>
+    <span class="chip">Compensation</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p>When a feature needs <strong>several services (and sometimes people) to cooperate over a long time</strong>, you cannot wrap it in one ACID transaction. Instead you split it into <strong>steps</strong>, make every step individually reliable, and define what "undo" means if a later step fails. Climb this ladder and stop as soon as the problem is solved:</p>
+  <ol>
+    <li><strong>Hand-rolled state machine</strong>: a status column, a cron job and retry code. Fine for two or three steps inside one service, and it rots quickly beyond that.</li>
+    <li><strong>The saga pattern</strong>: a sequence of <em>local</em> transactions, each paired with a <em>compensating</em> transaction that semantically undoes it. Coordinated either by a central <em>orchestrator</em> or by services reacting to each other's events (<em>choreography</em>).</li>
+    <li><strong>A durable workflow engine</strong> (Temporal, AWS Step Functions, Azure Durable Functions, Conductor, Camunda): you write the flow as ordinary code or a state-machine definition, the engine persists every completed step, and after a crash the workflow resumes exactly where it stopped, with retries, timers and a full history for free.</li>
+  </ol>
+  <p>Underneath all three sits the same toolkit: <strong>idempotency keys</strong> (so a retry never charges the card twice), <strong>timeouts</strong>, and the <strong>transactional outbox</strong> (so state changes and the messages announcing them never diverge).</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>One request fans out into <strong>several services or third-party APIs</strong> (payments, shipping, email, KYC).</li>
+      <li>The flow includes a <strong>human step</strong> or an external callback: warehouse pick, manual approval, driver acceptance.</li>
+      <li>It can take <strong>minutes, hours or days</strong>, so you cannot hold a connection or a lock open.</li>
+      <li>The prompt says "if step N fails, we have to undo steps 1 to N-1", or "what if the server crashes in the middle?"</li>
+      <li>Typical nouns: checkout, order fulfilment, booking, onboarding, loan approval, ride dispatch, money transfer.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>Take an online store. Behind a single "Buy" click the system must: <strong>reserve the inventory</strong>, <strong>charge the card</strong>, <strong>create a shipping label</strong>, <strong>wait for someone in a warehouse to physically pick the item off a shelf</strong>, and finally <strong>send a confirmation</strong>. That is at least four services, two of which are third-party APIs, plus a human. It can take days.</p>
+
+  <h3>Why one ACID transaction is impossible</h3>
+  <ul>
+    <li><strong>Each service owns its database.</strong> In a microservice architecture the inventory, payments and shipping services have separate datastores. A <code>BEGIN ... COMMIT</code> only spans one database.</li>
+    <li><strong>Third-party systems don't join your transaction.</strong> Stripe, a carrier API or an email provider cannot be "rolled back" by your database; they expose ordinary HTTP calls with their own side effects.</li>
+    <li><strong>Humans and clocks.</strong> A transaction that waits two days for a warehouse worker would hold locks for two days. Databases are built for transactions measured in milliseconds.</li>
+    <li><strong>Availability.</strong> Coordinating many independent systems atomically means the whole operation is only as available as the <em>worst</em> participant.</li>
+  </ul>
+
+  <h3>What actually goes wrong</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Failure mode</th><th>Example</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Crash between steps</td><td>Process dies after charging the card but before creating the label.</td><td>Customer paid, nothing ships, and nobody remembers the order was half done.</td></tr>
+        <tr><td>Timeout with unknown outcome</td><td>The charge call times out. Did the money move or not?</td><td>Retrying may double charge; not retrying may lose the sale.</td></tr>
+        <tr><td>Duplicates</td><td>A message broker redelivers, a user double-clicks, a retry fires.</td><td>Two shipments, two emails, two charges.</td></tr>
+        <tr><td>Partial completion</td><td>Inventory reserved, payment declined.</td><td>Stock is stuck in "reserved" forever unless something releases it.</td></tr>
+        <tr><td>Stuck or lost work</td><td>The warehouse never confirms the pick.</td><td>Order sits in limbo; needs a timer, an alert and an escalation path.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>If you solve this by hand, with status columns, cron jobs and retry logic scattered across five services, nobody can answer "where is order 8123 right now?" and the on-call engineer inherits a mess. The pattern is about replacing that scatter with something <strong>explicit, durable and observable</strong>.</p>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>It shows up whenever a design includes money, physical goods, or more than one team's services. Typical prompts:</p>
+  <ul>
+    <li><strong>E-commerce checkout / order fulfilment</strong>: the running example on this page.</li>
+    <li><strong>Ticketing and booking (Ticketmaster, Airbnb, flights)</strong>: hold a seat, take payment, issue the ticket, release the hold on failure.</li>
+    <li><strong>Payments and money transfer</strong>: debit one account, credit another, notify, reconcile.</li>
+    <li><strong>Ride-hailing / food delivery</strong>: match, driver accepts (human), pick up, drop off, charge.</li>
+    <li><strong>Media pipelines (YouTube-style)</strong>: upload, transcode, moderate, publish. See <a href="04-large-blobs.html">Handling Large Blobs</a>.</li>
+    <li><strong>Onboarding, KYC and approvals</strong>: multi-day flows with documents, reviewers and reminders.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>Start with the simplest thing that keeps you correct. Each step below buys more reliability and visibility at the price of more machinery, so don't jump to a workflow engine for a two-step flow, and don't hand-roll a six-step flow that spans days.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Reach for it when…</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Hand-rolled state machine (status column, cron, retries)</td><td>2 or 3 steps, one service, short-lived</td><td>Rots as steps, retries and teams multiply; no history</td></tr>
+        <tr><td>2</td><td>Saga (orchestrated or choreographed)</td><td>Multiple services each with their own database; need to undo on failure</td><td>Compensations, no isolation, lots of plumbing</td></tr>
+        <tr><td>3</td><td>Durable workflow engine (Temporal, Step Functions, ...)</td><td>Long-running, human steps, many steps, retries and visibility matter</td><td>New infrastructure, determinism rules, learning curve</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Note that steps 2 and 3 are not alternatives so much as layers: a workflow engine is essentially a <strong>saga orchestrator you don't have to build yourself</strong>. The saga is the <em>design</em>; the engine is a way to <em>run</em> it reliably.</p>
+
+  <h3><span class="step">Step 1</span>Hand-rolled state machine</h3>
+  <p>The natural first attempt: add a <code>status</code> column to the <code>orders</code> table (<code>PENDING</code>, <code>PAID</code>, <code>RESERVED</code>, <code>SHIPPED</code>, ...). The code that handles each step updates the status after it succeeds. A cron job periodically scans for orders stuck in an intermediate status and retries them. Retries use a <code>retry_count</code> column and some backoff.</p>
+
+<pre><code>-- Every few minutes, a cron job does something like this:
+SELECT id FROM orders
+WHERE status = 'PAID'
+  AND updated_at &lt; now() - interval '10 minutes'
+  AND retry_count &lt; 5;
+-- ...then re-calls the shipping service for each one.</code></pre>
+
+  <p>For a short flow inside one service, this is perfectly reasonable, and you should not be embarrassed to say so in an interview. A well-modelled state machine (explicit allowed transitions, row-level locking or a version column, idempotent handlers) is the seed of everything that follows.</p>
+
+  <h4>Why it rots</h4>
+  <ul>
+    <li><strong>State is scattered.</strong> Each service has its own status column, cron job and retry logic. The "real" state of an order is the combination of five tables.</li>
+    <li><strong>Crash windows everywhere.</strong> Between "call the payment API" and "write status = PAID" there is a gap. If the process dies in it, the cron job will charge again unless every call is carefully idempotent.</li>
+    <li><strong>Retry logic is re-invented per call.</strong> Backoff, jitter, max attempts, dead-lettering: each one is written (and gets bugs) many times.</li>
+    <li><strong>Timers are painful.</strong> "Cancel the order if the warehouse hasn't picked it within 3 days" turns into yet another cron query and another column.</li>
+    <li><strong>No history.</strong> You see the current status, not what happened. Debugging "why was this customer double charged?" means digging through logs of five services.</li>
+    <li><strong>Compensation is ad hoc.</strong> Undo logic lives wherever someone remembered to put it.</li>
+  </ul>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>No new infrastructure</li>
+      <li>Easy to understand for 2 or 3 steps</li>
+      <li>Fine when everything is in one database (then use one transaction)</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Reliability logic duplicated and bug-prone</li>
+      <li>Hard to observe, hard to change safely</li>
+      <li>Timers, human steps and compensation are all bolt-ons</li>
+      <li>The on-call engineer pays the bill</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 2</span>The Saga pattern: why and how</h3>
+
+  <h4>1. Why it exists: the problem with two-phase commit</h4>
+  <p>The textbook answer to "make several databases commit atomically" is <strong>two-phase commit (2PC)</strong>. A <em>coordinator</em> asks every participant to <strong>prepare</strong> (do the work, write it durably, hold the locks, and promise it can commit). If all say yes, the coordinator tells everyone to <strong>commit</strong>; if any says no, everyone aborts. It gives true atomicity, and it is exactly what you do <em>not</em> want across microservices:</p>
+  <ul>
+    <li><strong>Locks are held across services</strong> for the whole protocol. Any other transaction touching those rows waits.</li>
+    <li><strong>It blocks if the coordinator dies</strong> after participants have prepared: they are "in doubt", holding locks, and cannot decide alone.</li>
+    <li><strong>Many participants can't do it.</strong> Third-party APIs, SaaS products, most NoSQL stores and message brokers don't support XA/2PC at all.</li>
+    <li><strong>Availability and latency suffer.</strong> The operation needs <em>every</em> participant up, and latency is the sum of two round trips to the slowest one.</li>
+    <li><strong>It doesn't fit long-running or human steps.</strong> You can't hold locks for three days.</li>
+  </ul>
+  <p>A <strong>saga</strong> (Garcia-Molina and Salem, 1987, originally for long-lived database transactions) takes the opposite trade. It is a <strong>sequence of local transactions</strong>: each service commits its own change to its own database immediately, then triggers the next step through a message or call. Since earlier steps are already committed, a failure later on <strong>cannot roll them back</strong>. Instead the saga runs <strong>compensating transactions</strong> that <em>semantically undo</em> what was done. You give up all-or-nothing isolation in exchange for availability, autonomy and the ability to run for days.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Two-phase commit</th><th>Saga</th></tr></thead>
+      <tbody>
+        <tr><td>Atomicity</td><td>All-or-nothing, enforced by the protocol</td><td>Eventual: either all steps complete or all done steps are compensated</td></tr>
+        <tr><td>Isolation</td><td>Yes (locks held during prepare)</td><td>No: intermediate state is visible to others</td></tr>
+        <tr><td>Locking</td><td>Locks across participants until commit</td><td>Only short local locks inside each local transaction</td></tr>
+        <tr><td>Availability</td><td>Low: all participants must be up</td><td>High: steps can be retried later</td></tr>
+        <tr><td>Coordinator</td><td>Required; a single point of blocking</td><td>Orchestrator or none (events); can be made durable</td></tr>
+        <tr><td>Latency</td><td>Two synchronized rounds to the slowest participant</td><td>Each step is local; end-to-end can be slow but nothing blocks</td></tr>
+        <tr><td>Complexity</td><td>Hidden in the protocol and the database</td><td>Pushed into your code: compensations, idempotency, state</td></tr>
+        <tr><td>Fits long-running / human steps</td><td>No</td><td>Yes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>2. How it works: the store example</h4>
+  <p>Break the order into four local transactions, each (except the last) with a compensation:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Local transaction</th><th>Service</th><th>Compensation</th></tr></thead>
+      <tbody>
+        <tr><td>T1 Reserve inventory</td><td>Inventory</td><td>C1 Release the reservation</td></tr>
+        <tr><td>T2 Charge card</td><td>Payments</td><td>C2 Refund the charge</td></tr>
+        <tr><td>T3 Create shipping label</td><td>Shipping</td><td>C3 Void the label</td></tr>
+        <tr><td>T4 Notify customer</td><td>Notifications</td><td>None needed: retriable, and a failure here must not undo the order</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Happy path.</strong> Each step commits locally and hands off to the next. Nothing is ever rolled back; if everything succeeds, the compensations are simply never used.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 150" role="img" aria-label="Happy path of a saga: four local transactions reserve inventory, charge card, create label, notify customer, each committing in turn">
+      <rect class="n-g" x="10" y="25" width="160" height="60" rx="8"/>
+      <text class="t t-mid" x="90" y="50">T1</text><text class="t t-mid" x="90" y="70">Reserve inventory</text>
+      <rect class="n-g" x="205" y="25" width="160" height="60" rx="8"/>
+      <text class="t t-mid" x="285" y="50">T2</text><text class="t t-mid" x="285" y="70">Charge card</text>
+      <rect class="n-g" x="400" y="25" width="160" height="60" rx="8"/>
+      <text class="t t-mid" x="480" y="50">T3</text><text class="t t-mid" x="480" y="70">Create label</text>
+      <rect class="n-g" x="595" y="25" width="160" height="60" rx="8"/>
+      <text class="t t-mid" x="675" y="50">T4</text><text class="t t-mid" x="675" y="70">Notify customer</text>
+      <line class="l-g" x1="170" y1="55" x2="203" y2="55" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="365" y1="55" x2="398" y2="55" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="560" y1="55" x2="593" y2="55" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="90" y="108">undo: C1 release stock</text>
+      <text class="t-s t-mid" x="285" y="108">undo: C2 refund</text>
+      <text class="t-s t-mid" x="480" y="108">undo: C3 void label</text>
+      <text class="t-s t-mid" x="675" y="108">no undo needed</text>
+      <text class="t-s" x="10" y="136">Each box is a local transaction that commits on its own. The undo actions are only used if a later step fails.</text>
+    </svg>
+    <figcaption>Happy path: four local transactions, each committed independently.</figcaption>
+  </figure>
+
+  <p><strong>Failure at T3.</strong> Suppose the shipping provider is down for longer than the retry budget. T1 and T2 have already committed, so we cannot roll them back. Instead the saga runs the compensations for the <em>completed</em> steps, <strong>in reverse order</strong>: first C2 (refund the card), then C1 (release the stock). T3 itself failed, so it needs no compensation, and T4 never runs.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 250" role="img" aria-label="Saga failure: T3 fails, so compensation C2 refund runs, then C1 release inventory, in reverse order">
+      <rect class="n-g" x="10" y="20" width="160" height="60" rx="8"/>
+      <text class="t t-mid" x="90" y="45">T1</text><text class="t t-mid" x="90" y="65">Reserve inventory</text>
+      <rect class="n-g" x="205" y="20" width="160" height="60" rx="8"/>
+      <text class="t t-mid" x="285" y="45">T2</text><text class="t t-mid" x="285" y="65">Charge card</text>
+      <rect class="n-b" x="400" y="20" width="160" height="60" rx="8"/>
+      <text class="t t-b t-mid" x="480" y="45">T3 FAILS</text><text class="t t-mid" x="480" y="65">Create label</text>
+      <rect class="n" x="595" y="20" width="160" height="60" rx="8"/>
+      <text class="t-s t-mid" x="675" y="45">T4</text><text class="t-s t-mid" x="675" y="65">never runs</text>
+      <line class="l-g" x1="170" y1="50" x2="203" y2="50" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="365" y1="50" x2="398" y2="50" marker-end="url(#arrow)"/>
+      <line class="l dash" x1="560" y1="50" x2="593" y2="50"/>
+      <rect class="n-w" x="10" y="150" width="160" height="50" rx="8"/>
+      <text class="t t-mid" x="90" y="170">C1</text><text class="t t-mid" x="90" y="188">Release inventory</text>
+      <rect class="n-w" x="205" y="150" width="160" height="50" rx="8"/>
+      <text class="t t-mid" x="285" y="170">C2</text><text class="t t-mid" x="285" y="188">Refund card</text>
+      <path class="l-b" d="M480 82 V175 H367" marker-end="url(#arrow)"/>
+      <line class="l-b" x1="203" y1="175" x2="172" y2="175" marker-end="url(#arrow)"/>
+      <text class="t-b" x="492" y="125">failure triggers rollback-by-compensation</text>
+      <text class="t-b" x="492" y="145">1st: C2 refund, 2nd: C1 release</text>
+      <text class="t-s" x="10" y="236">Compensations run right to left, newest completed step first. They are new transactions, not a rollback.</text>
+    </svg>
+    <figcaption>Failure at T3: compensations run in reverse order for the steps that had completed.</figcaption>
+  </figure>
+
+  <h4>3. Design rules for a correct saga</h4>
+  <ul>
+    <li><strong>Compensation is semantic undo, not rollback.</strong> A refund is not "un-charging": the customer sees a charge and a refund, and the payment provider may keep a fee. A sent email cannot be unsent, so the compensation is a <em>correction</em> email. Design each compensation as a real business action.</li>
+    <li><strong>Compensations must be idempotent.</strong> They will be retried, possibly concurrently with a delayed duplicate of the original step. "Refund charge ch_123" must be safe to run twice (use the charge id or an idempotency key).</li>
+    <li><strong>Compensations must be retried until they succeed.</strong> A compensation that fails permanently leaves money or stock in limbo. Retry with backoff forever, and page a human (or open a manual-intervention task) if it stays stuck. This is why compensations should be simple and have few dependencies.</li>
+    <li><strong>Order the steps by how hard they are to undo.</strong> Think of three groups:
+      <ol>
+        <li><em>Compensable transactions</em>: can be undone (reserve stock, place a hold on funds, create a label).</li>
+        <li>The <em>pivot transaction</em>: the point of no return. If it succeeds the saga is committed to finishing; if it fails the saga compensates. In the store, a defensible pivot is "the carrier takes the parcel". Some teams treat a successful card capture as the pivot instead; what matters is that you <em>decide</em> where it is.</li>
+        <li><em>Retriable transactions</em>: steps after the pivot that must eventually succeed and are safe to retry forever (send the confirmation, update analytics). They never trigger compensation.</li>
+      </ol>
+      Put risky, failure-prone or expensive-to-undo steps late and cheap, easily reversed ones early.</li>
+    <li><strong>Persist the saga's progress.</strong> Every saga has a unique <strong>saga / correlation id</strong> (the order id works) and a durable record of which steps are done, in flight or compensated. Without it, a crash loses the thread. This is the state a workflow engine keeps for you.</li>
+    <li><strong>Use timeouts everywhere.</strong> A step that never replies must eventually count as failed (or be checked), otherwise the saga hangs forever.</li>
+    <li><strong>Handle "unknown outcome".</strong> After a timeout you don't know whether the downstream work happened. Either <em>query</em> the downstream by your correlation id ("is there a charge for order 8123?") or simply <em>retry with the same idempotency key</em> so the downstream deduplicates. Never retry a non-idempotent call blind.</li>
+  </ul>
+
+  <h4>4. Two ways to coordinate: orchestration vs choreography</h4>
+  <p>Someone has to decide "what runs next" and "what do we undo". There are two styles.</p>
+
+  <p><strong>Orchestration.</strong> A central <strong>orchestrator</strong> (a state machine or workflow) holds the saga's logic. It sends a command to each service ("reserve stock"), waits for the reply, decides the next step, and on failure issues the compensation commands. Services don't know about each other; they only know how to execute their own command.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 240" role="img" aria-label="Orchestration: a central saga orchestrator sends commands to inventory, payment, shipping and notification services and receives their replies">
+      <rect class="n-a" x="235" y="15" width="230" height="64" rx="8"/>
+      <text class="t t-mid" x="350" y="42">Saga orchestrator</text>
+      <text class="t-s t-mid" x="350" y="62">state machine + persisted saga log</text>
+      <rect class="n" x="20" y="150" width="140" height="50" rx="8"/><text class="t t-mid" x="90" y="180">Inventory</text>
+      <rect class="n" x="190" y="150" width="140" height="50" rx="8"/><text class="t t-mid" x="260" y="180">Payments</text>
+      <rect class="n" x="360" y="150" width="140" height="50" rx="8"/><text class="t t-mid" x="430" y="180">Shipping</text>
+      <rect class="n" x="530" y="150" width="140" height="50" rx="8"/><text class="t t-mid" x="600" y="180">Notifications</text>
+      <line class="l-a" x1="300" y1="81" x2="100" y2="148" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="330" y1="81" x2="255" y2="148" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="370" y1="81" x2="435" y2="148" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="400" y1="81" x2="590" y2="148" marker-end="url(#arrow)"/>
+      <text class="t-s" x="20" y="226">Commands flow out, replies come back to the orchestrator, which owns ordering, retries and compensation.</text>
+    </svg>
+    <figcaption>Orchestrated saga: one place knows the whole flow.</figcaption>
+  </figure>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>The whole flow is in one place: easy to read, test, monitor</li>
+      <li>Adding or reordering steps touches one component</li>
+      <li>No cyclic dependencies between services</li>
+      <li>Simple to answer "where is order X?"</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Risk of a central coupling point and single point of failure (mitigate by running it on a durable engine)</li>
+      <li>Danger of a "god service" holding business logic that belongs elsewhere</li>
+      <li>One more component to build and operate (unless you buy it)</li>
+    </ul></div>
+  </div>
+
+  <p><strong>Choreography.</strong> No central brain. Each service does its local transaction and <strong>publishes an event</strong> to a broker (Kafka, SNS/SQS, RabbitMQ). The next service subscribes to that event and reacts. For compensation, a failing service publishes a failure event (<code>PaymentFailed</code>) and earlier services subscribe to it and undo their work (<code>StockReleased</code>).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 230" role="img" aria-label="Choreography: order, inventory, payment and shipping services publish and subscribe to events on a shared message broker">
+      <rect class="n" x="20" y="12" width="150" height="48" rx="8"/><text class="t t-mid" x="95" y="41">Orders</text>
+      <rect class="n" x="215" y="12" width="150" height="48" rx="8"/><text class="t t-mid" x="290" y="41">Inventory</text>
+      <rect class="n" x="410" y="12" width="150" height="48" rx="8"/><text class="t t-mid" x="485" y="41">Payments</text>
+      <rect class="n" x="605" y="12" width="150" height="48" rx="8"/><text class="t t-mid" x="680" y="41">Shipping</text>
+      <rect class="n-w" x="20" y="100" width="735" height="40" rx="8"/>
+      <text class="t t-mid" x="387" y="125">Message broker (Kafka / SNS + SQS / RabbitMQ)</text>
+      <line class="l-a" x1="80" y1="62" x2="80" y2="98" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="110" y1="98" x2="110" y2="64" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="275" y1="62" x2="275" y2="98" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="305" y1="98" x2="305" y2="64" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="470" y1="62" x2="470" y2="98" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="500" y1="98" x2="500" y2="64" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="665" y1="62" x2="665" y2="98" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="695" y1="98" x2="695" y2="64" marker-end="url(#arrow)"/>
+      <text class="t-a" x="20" y="170">Blue arrows: publish events. Green arrows: subscribe and react.</text>
+      <text class="t-s" x="20" y="195">Happy path: OrderPlaced, then StockReserved, then PaymentCharged, then LabelCreated.</text>
+      <text class="t-s" x="20" y="214">Failure path: PaymentFailed makes Inventory release stock and Orders cancel the order.</text>
+    </svg>
+    <figcaption>Choreographed saga: services react to each other's events; nobody owns the full flow.</figcaption>
+  </figure>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>No central coordinator to build or fail</li>
+      <li>Services stay loosely coupled; easy for a small saga of 2 or 3 steps</li>
+      <li>Natural fit when events already flow on a broker</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>The flow exists only implicitly across many services: hard to follow and document</li>
+      <li>Risk of cyclic event dependencies</li>
+      <li>Hard to debug and monitor as it grows; no single place for "status of order X"</li>
+      <li>Adding a step means editing several services</li>
+    </ul></div>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-title">Rule of thumb</span>
+    <p>Choreography for sagas of about 2 to 3 steps among services that already communicate by events. <strong>Orchestration</strong> as soon as there are more steps, branching, timers, human steps or you need visibility. In interviews, orchestration backed by a durable engine is usually the stronger default answer.</p>
+  </div>
+
+  <h4>5. The lack of isolation</h4>
+  <p>Sagas give you <strong>ACD, not ACID</strong>: atomicity (eventually, via compensation), consistency and durability, but no <strong>isolation</strong>. Because each local transaction commits immediately, other transactions can see the saga's intermediate state, and that state may later be compensated away. Typical anomalies:</p>
+  <ul>
+    <li><strong>Dirty reads:</strong> someone reads "stock reserved" or "payment charged" for an order that is later cancelled.</li>
+    <li><strong>Lost updates:</strong> a second saga overwrites a change the first saga made, which the first saga's compensation then clobbers.</li>
+    <li><strong>Non-repeatable reads:</strong> two reads inside one saga return different values because another saga changed the data in between.</li>
+  </ul>
+  <p>Countermeasures (from the "Microservices Patterns" literature):</p>
+  <ul>
+    <li><strong>Semantic lock:</strong> a flag or status such as <code>PENDING</code> or <code>reserved_by = order_8123</code> marks a record as being part of an unfinished saga. Other transactions skip it, wait, or treat it as unavailable. The saga clears it at the end (or in compensation).</li>
+    <li><strong>Commutative updates:</strong> design operations so order doesn't matter (<code>stock = stock - 1</code> / <code>stock = stock + 1</code> rather than <code>stock = 41</code>), so interleavings and compensations compose safely.</li>
+    <li><strong>Pessimistic view:</strong> reorder the steps so the dangerous anomaly can't happen. For example, take the reversible "hold" first and make the irreversible decrement last.</li>
+    <li><strong>Reread value:</strong> before overwriting, re-read the record and check it is unchanged (an optimistic check). Use a <strong>version column</strong> or compare-and-set so a stale write fails instead of silently winning. See <a href="03-contention.html">Dealing with Contention</a> for optimistic concurrency control.</li>
+    <li><strong>By value:</strong> pick the mechanism by business risk. Low-value orders can use the cheap countermeasures above; high-risk ones (large transfers) can be routed through stronger mechanisms such as a distributed lock or a single partition.</li>
+    <li><strong>Design the UI and states honestly:</strong> show "Order pending" or "Payment processing", never "Confirmed" until the saga reaches its terminal state. Intermediate states are part of the product.</li>
+  </ul>
+
+  <h4>6. Reliability plumbing: outbox and inbox</h4>
+  <p>Each saga step has a dual-write problem: it must <strong>update its database</strong> <em>and</em> <strong>send a message</strong> (event or command). If it commits and then crashes before publishing, the saga stalls silently. If it publishes first and the commit fails, downstream acts on something that never happened.</p>
+  <p>The fix is the <strong>transactional outbox</strong>:</p>
+  <ol>
+    <li>In <em>one local transaction</em>, write the business change <strong>and</strong> a row into an <code>outbox</code> table describing the message to send. Either both commit or neither does.</li>
+    <li>A separate <strong>relay</strong> reads new outbox rows and publishes them to the broker, then marks them sent. The relay can poll the table, or use change-data-capture (for example Debezium tailing the database log).</li>
+    <li>Delivery is <strong>at least once</strong>: the relay may publish, crash before marking, and publish again. So duplicates are normal.</li>
+  </ol>
+  <p>The receiving side therefore needs an <strong>idempotent consumer</strong> (sometimes called an <em>inbox</em>): record the ids of processed messages in the same local transaction as the work, and ignore any message id it has already seen. Outbox + inbox together approximate exactly-once <em>effects</em> on top of at-least-once delivery.</p>
+
+<pre><code>BEGIN;
+  UPDATE inventory SET reserved = reserved + 1 WHERE sku = 'A1' AND ...;
+  INSERT INTO outbox (id, saga_id, type, payload)
+    VALUES (gen_random_uuid(), 'order-8123', 'StockReserved', '{...}');
+COMMIT;
+-- relay: SELECT ... FROM outbox WHERE sent_at IS NULL; publish; UPDATE ... SET sent_at = now();</code></pre>
+
+  <h4>7. Relationship to workflow engines</h4>
+  <p>An orchestrated saga needs: a durable record of progress, retries with backoff, timers, timeouts, a way to wait for external events, and a log of what happened. That is precisely what Temporal and AWS Step Functions provide. They are, in effect, <strong>a saga orchestrator you don't have to build</strong>. The canonical way to write a saga in Temporal is to append a compensation to a list each time a step succeeds, and on failure run that list in reverse (full code in Step 3 below).</p>
+
+  <div class="callout interview">
+    <span class="callout-title">If asked: "Why a saga instead of two-phase commit?"</span>
+    <blockquote>"2PC would need every service and the payment provider to support distributed transactions, it holds locks across all of them while a coordinator decides, and if the coordinator dies the participants are stuck in doubt. That kills availability, and it can't span a warehouse worker who takes two days. So I use a saga: each service commits a local transaction and I define a compensating action for each, like refund or release stock, run in reverse if a later step fails. I give up isolation, so I add semantic locks like a PENDING status, make every step and compensation idempotent, and use an outbox so state and events can't diverge. I'd run it as an orchestrated workflow so the state, retries and timers are durable."</blockquote>
+  </div>
+
+  <h3><span class="step">Step 3</span>Durable workflow engines (Temporal, Step Functions and friends)</h3>
+  <p>Once a workflow spans days and has to survive failures and retries, stop building the plumbing. A <strong>workflow engine</strong> (also called <em>durable execution</em>) lets you write the process as ordinary code or a declarative state machine. The engine <strong>records every step it completes</strong>, and when a machine dies the workflow <strong>picks up exactly where it left off</strong>, with retries and a full history of what happened.</p>
+
+  <h4>How durable execution works</h4>
+  <figure class="diagram">
+    <svg viewBox="0 0 780 230" role="img" aria-label="Durable execution: workflow workers send commands to the engine which stores event history and dispatches activity tasks to activity workers">
+      <rect class="n" x="10" y="45" width="170" height="80" rx="8"/>
+      <text class="t t-mid" x="95" y="78">Workflow worker</text><text class="t-s t-mid" x="95" y="100">your workflow code</text>
+      <rect class="n-a" x="305" y="45" width="170" height="80" rx="8"/>
+      <text class="t t-mid" x="390" y="78">Engine service</text><text class="t-s t-mid" x="390" y="100">durable event history</text>
+      <rect class="n-g" x="600" y="45" width="170" height="80" rx="8"/>
+      <text class="t t-mid" x="685" y="78">Activity workers</text><text class="t-s t-mid" x="685" y="100">side effects: APIs, DBs</text>
+      <line class="l-a" x1="180" y1="70" x2="303" y2="70" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="242" y="62">commands</text>
+      <line class="l" x1="303" y1="100" x2="182" y2="100" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="242" y="116">history events</text>
+      <line class="l-g" x1="475" y1="70" x2="598" y2="70" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="537" y="62">activity tasks</text>
+      <line class="l" x1="598" y1="100" x2="477" y2="100" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="537" y="116">results</text>
+      <text class="t-s" x="10" y="165">Every command and result is appended to the history. Workers are stateless and can die at any time.</text>
+      <text class="t-s" x="10" y="185">A new worker replays the history through your code: finished activities return their recorded result</text>
+      <text class="t-s" x="10" y="205">instead of re-running, so the code fast-forwards to the first unfinished step.</text>
+    </svg>
+    <figcaption>The engine owns durable state; workers are disposable.</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>Event-sourced history.</strong> The engine stores an append-only log per workflow execution: "workflow started", "activity reserve_inventory scheduled", "activity completed with result X", "timer started", "signal received", and so on. This log <em>is</em> the workflow's state.</li>
+    <li><strong>Workflow code vs activities.</strong> The workflow function contains only <em>orchestration logic</em>. Anything with a side effect (HTTP call, database write, sending an email) lives in an <strong>activity</strong>. Activities may fail and are retried; their results are recorded in the history.</li>
+    <li><strong>Replay on recovery.</strong> When a worker crashes (or the workflow is evicted from memory after a long sleep), another worker loads the history and <strong>re-executes the workflow function from the top</strong>. Each time the code reaches an activity call that already has a recorded result, the engine returns that result immediately without running it again. When the code reaches the first call with no result, it continues for real. The workflow appears to resume mid-function, even though no thread was ever kept alive.</li>
+    <li><strong>Determinism is mandatory.</strong> Because the code is replayed, it must make the same decisions given the same history. So workflow code must not call <code>random()</code>, read the wall clock, spawn raw threads, or do I/O directly. Use the engine's APIs instead (<code>workflow.now()</code>, <code>workflow.sleep()</code>, side-effect and random helpers). Violations surface as "non-determinism errors" on replay.</li>
+    <li><strong>Timers cost nothing.</strong> <code>await sleep(3 days)</code> just records a timer in the history. No process is blocked, nothing polls, and it survives restarts. This is how "cancel if not picked within 3 days" and "send a reminder tomorrow" become one line of code.</li>
+    <li><strong>Signals for human-in-the-loop events.</strong> An external system (the warehouse app) sends a <em>signal</em> such as <code>item_picked</code> to the running workflow by id. The workflow waits for it, optionally with a timeout. AWS Step Functions does the same with the <em>callback pattern</em> (<code>.waitForTaskToken</code>): the state pauses until someone calls <code>SendTaskSuccess</code> with the token.</li>
+    <li><strong>Queries for status.</strong> A read-only <em>query</em> ("what step is order 8123 on?") inspects workflow state without changing it. This replaces the scattered status columns and powers a status page. (Pushing it to the browser: <a href="06-real-time-updates.html">Real-Time Updates</a>.)</li>
+    <li><strong>Child workflows</strong> split a big process into sub-workflows (one per shipment, say) with their own histories and failure handling.</li>
+    <li><strong>Versioning.</strong> Workflows can be running for weeks, so changing the code can break replay of in-flight executions. Engines provide <em>versioning/patching</em> APIs (Temporal's <code>patched()</code>/worker versioning) or you start new executions on new code and let old ones drain.</li>
+    <li><strong>History limits.</strong> Histories are bounded (on the order of tens of thousands of events in Temporal and Step Functions). Long-lived loops use "continue-as-new" or restart themselves with fresh history.</li>
+  </ul>
+
+  <h4>Activities: retries, timeouts and idempotency</h4>
+  <p>The engine retries failed activities according to a <strong>retry policy</strong> (initial interval, backoff coefficient, maximum interval, maximum attempts, and a list of non-retryable errors such as "card declined"). Timeouts bound each phase of an activity. In Temporal terms:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Timeout</th><th>What it bounds</th><th>Why you set it</th></tr></thead>
+      <tbody>
+        <tr><td>Schedule-to-start</td><td>Time an activity task waits in the queue for a worker</td><td>Detects that no worker is available or workers are overloaded</td></tr>
+        <tr><td>Start-to-close</td><td>One execution attempt of the activity</td><td>The key one: a hung API call is cut off and retried</td></tr>
+        <tr><td>Schedule-to-close</td><td>Total time including all retries</td><td>Caps how long a step may keep trying overall</td></tr>
+        <tr><td>Heartbeat</td><td>Gap between "I'm alive" signals from a long activity</td><td>Detects a crashed worker quickly during long-running work, and lets it resume from a checkpoint</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Engines give you <strong>at-least-once</strong> activity execution: an activity may run, succeed, and have its completion lost to a crash, so it runs again. Hence activities <strong>must be idempotent</strong>. The standard technique is an <strong>idempotency key</strong>: a stable unique id (order id plus step name) sent with the call. The downstream service stores the key with the result and, on a repeat, returns the original result instead of redoing the work. Stripe accepts an <code>Idempotency-Key</code> header for exactly this. That is how you achieve "charge the card exactly once, <em>effectively</em>" on top of at-least-once delivery. For unknown outcomes (timeout), retry with the same key.</p>
+
+  <h4>The store order as a Temporal-style saga</h4>
+  <p>Pseudo-code in Python in the style of the Temporal SDK. Notice how the saga, the waiting for a human, the timeout, and the compensation are all just normal control flow:</p>
+
+<pre><code>@workflow.defn
+class OrderWorkflow:
+    def __init__(self):
+        self.picked = False
+
+    @workflow.signal                      # sent by the warehouse app
+    def item_picked(self):
+        self.picked = True
+
+    @workflow.query                       # powers "where is my order?"
+    def status(self) -&gt; str:
+        return self._status
+
+    @workflow.run
+    async def run(self, order: Order) -&gt; str:
+        compensations = []                # undo actions, newest last
+        opts = dict(start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=5,
+                        non_retryable_error_types=["CardDeclined"]))
+        try:
+            self._status = "RESERVING"
+            await workflow.execute_activity(reserve_inventory, order, **opts)
+            compensations.append((release_inventory, order))
+
+            self._status = "CHARGING"      # idempotency key = order.id
+            await workflow.execute_activity(charge_card, order, **opts)
+            compensations.append((refund_card, order))
+
+            self._status = "LABELING"
+            await workflow.execute_activity(create_label, order, **opts)
+            compensations.append((void_label, order))
+
+            self._status = "AWAITING_PICK"  # human step, can take days
+            await workflow.wait_condition(lambda: self.picked,
+                                          timeout=timedelta(days=3))
+
+            # pivot passed: from here on we only move forward
+            await workflow.execute_activity(
+                send_confirmation, order,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=0))  # retry forever
+            return "COMPLETED"
+
+        except (ActivityError, asyncio.TimeoutError):
+            self._status = "COMPENSATING"
+            for activity, arg in reversed(compensations):
+                await workflow.execute_activity(
+                    activity, arg,
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=0))  # until it works
+            return "CANCELLED"</code></pre>
+
+  <ul>
+    <li><code>compensations</code> is the saga's undo log: a step is added only <em>after</em> it succeeds, and on failure the list is run in reverse.</li>
+    <li>Compensation activities are retried without a cap, because a compensation must not fail permanently. Alert on them when they exceed a threshold.</li>
+    <li>If the process running this function dies at any line, replay brings another worker back to that exact line with all local variables (including <code>compensations</code>) reconstructed from history.</li>
+    <li>Real code also handles cancellation (run compensations in a detached/shielded scope so a cancel request doesn't abort the cleanup) and puts the pivot decision explicitly in the code.</li>
+  </ul>
+  <p>In <strong>AWS Step Functions</strong> the same flow is a JSON state machine in the Amazon States Language (<code>Task</code>, <code>Choice</code>, <code>Wait</code>, <code>Parallel</code>, <code>Catch</code> and <code>Retry</code> blocks), drawn and debugged in a visual designer. A <code>Catch</code> on the failing state routes to compensation states. It is excellent for flows that mostly call AWS services; the trade-off is that complex logic becomes verbose JSON.</p>
+
+  <h4>Comparing the approaches</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Aspect</th><th>Hand-rolled</th><th>Saga via events (choreography)</th><th>Temporal / Cadence</th><th>AWS Step Functions</th></tr></thead>
+      <tbody>
+        <tr><td>Where logic lives</td><td>Status columns and cron in many services</td><td>Spread across services' event handlers</td><td>One workflow function in code</td><td>One state machine definition (JSON/ASL)</td></tr>
+        <tr><td>Durability of progress</td><td>You build it</td><td>Broker offsets plus per-service state</td><td>Built-in event history and replay</td><td>Built-in execution history</td></tr>
+        <tr><td>Retries and timers</td><td>Hand-written</td><td>Dead-letter queues, delayed messages</td><td>Declarative policies; sleeping for days is free</td><td>Declarative <code>Retry</code>, <code>Wait</code>; Standard runs up to 1 year</td></tr>
+        <tr><td>Human-in-the-loop</td><td>Extra tables and endpoints</td><td>Awkward</td><td>Signals</td><td>Callback with task token</td></tr>
+        <tr><td>Visibility</td><td>Logs and SQL</td><td>Tracing across services</td><td>Web UI, history, queries</td><td>Visual console and execution graph</td></tr>
+        <tr><td>Language support</td><td>Any</td><td>Any</td><td>Go, Java, Python, TypeScript, .NET, PHP and more</td><td>Language-agnostic; logic in ASL, code in Lambdas</td></tr>
+        <tr><td>Cost model</td><td>Your engineering time</td><td>Broker cost plus engineering time</td><td>Self-host (run the cluster) or Temporal Cloud (usage-based)</td><td>Per state transition (Standard) or per request and duration (Express); check current pricing</td></tr>
+        <tr><td>Ops burden</td><td>High, grows with scale</td><td>Medium to high</td><td>Medium self-hosted, low on cloud</td><td>Very low (serverless)</td></tr>
+        <tr><td>Limits to know</td><td>Whatever you built</td><td>Hard to reason about at scale</td><td>Determinism rules; history size; versioning discipline</td><td>Payload size (about 256 KB), history limits, vendor lock-in</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Crash-proof: resumes exactly where it stopped</li>
+      <li>Retries, timeouts, timers and compensation are first-class</li>
+      <li>Full audit trail of every step</li>
+      <li>Workflows read like normal code (Temporal) or a visual diagram (Step Functions)</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>New piece of critical infrastructure (or a vendor dependency)</li>
+      <li>Determinism and versioning rules to learn</li>
+      <li>Activities still need idempotency; the engine can't fix that for you</li>
+      <li>Overkill for simple or short flows</li>
+    </ul></div>
+  </div>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>This is where interviews are won. Each mechanism has a characteristic failure, and you should be ready to name it and its fix.</p>
+
+  <h3>No isolation, so users see intermediate states</h3>
+  <p>A customer may briefly see an order as "paid" that is later cancelled, or another buyer may see stock as unavailable while a reservation is pending. Use explicit pending states, semantic locks, and UIs that don't promise more than the saga has delivered. Often it is enough to make the intermediate state obviously provisional.</p>
+
+  <h3>Compensation that cannot fully undo</h3>
+  <p>Refunds take days and may cost fees; emails and physical shipments can't be recalled. Order steps so irreversible actions come last, and make compensation a business process (correction email, return label, credit) rather than assuming a perfect undo. Some failures end in a <strong>manual intervention queue</strong>, and your design should say so.</p>
+
+  <h3>Duplicates and idempotency gaps</h3>
+  <p>At-least-once delivery from brokers, retries from engines and users double-clicking all produce duplicates. Every step, every compensation and every consumer needs an idempotency key or a dedupe record. The engine retries safely only if the activity is idempotent.</p>
+
+  <h3>Stuck sagas</h3>
+  <p>A saga can sit forever waiting for a reply or a human. Give every wait a timeout and an escalation path (retry, alert, cancel). Monitor "sagas older than N" and sagas in <code>COMPENSATING</code> state, and keep a dead-letter or manual queue for ones that cannot proceed.</p>
+
+  <h3>Orchestrator as a bottleneck or single point of failure</h3>
+  <p>A hand-built orchestrator that holds state in memory is a liability. Persist saga state, run multiple instances, or use a durable engine whose availability and scaling are handled for you. Also keep business logic in the services; the orchestrator should only decide <em>what happens next</em>.</p>
+
+  <h3>Workflow versioning and long-running deploys</h3>
+  <p>A workflow started last week was written against last week's code. Changing step order or adding a step can break replay for in-flight executions. Plan for versioned workflows, or run old and new code side by side until old executions finish.</p>
+
+  <h3>Volume and cost</h3>
+  <p>Durable engines persist every step. At very high throughput (millions of tiny workflows) cost, history size and write amplification matter. Batch small items into one workflow, or keep the engine for the coordination-heavy flows and use a simple queue for the rest.</p>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Style</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Temporal (and its ancestor Cadence)</td><td>Durable execution, workflows as code</td><td>Go, Java, Python, TypeScript, .NET SDKs. Self-host or Temporal Cloud. Signals, queries, timers, child workflows, versioning. Strong default answer for complex, long-running flows.</td></tr>
+        <tr><td>AWS Step Functions</td><td>Managed state machine (ASL JSON, visual designer)</td><td>Standard workflows (up to 1 year, exactly-once execution, per-transition pricing) and Express (up to 5 minutes, high volume, at-least-once). Deep AWS service integrations. Callback pattern for human steps.</td></tr>
+        <tr><td>Azure Durable Functions</td><td>Durable execution in code</td><td>Orchestrator functions replayed from history, similar determinism rules to Temporal; external events and durable timers.</td></tr>
+        <tr><td>Netflix Conductor / Orkes</td><td>JSON-defined workflows with workers</td><td>Language-neutral task workers, visual UI. Good when many teams share workflows.</td></tr>
+        <tr><td>Camunda / Zeebe</td><td>BPMN diagrams</td><td>Business-process modelling that non-engineers can read; strong for approvals and human tasks.</td></tr>
+        <tr><td>Airflow, Dagster, Prefect</td><td>Scheduled DAGs for data pipelines</td><td>Batch and ETL orchestration, <em>not</em> per-request workflows. Mention it only to say why you are not using it here.</td></tr>
+        <tr><td>Saga libraries / frameworks</td><td>Orchestrated sagas in application code</td><td>Examples: Eventuate Tram Sagas, MassTransit and NServiceBus sagas, Axon. Fine for JVM or .NET shops that want to avoid a separate engine.</td></tr>
+        <tr><td>Messaging for choreography</td><td>Event backbone</td><td>Kafka, SNS/SQS, RabbitMQ, Pub/Sub, plus an outbox table and a relay (Debezium CDC or a poller).</td></tr>
+        <tr><td>Idempotency support</td><td>Dedupe store</td><td>A unique-key table in your database, Redis <code>SET NX</code> with TTL, or the provider's own idempotency header (Stripe).</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <ul>
+    <li><strong>A 2-step flow inside one database.</strong> If both writes live in the same database, use a plain transaction. A saga is for work that spans transaction boundaries, not a replacement for them.</li>
+    <li><strong>Simple fire-and-forget jobs.</strong> Resizing an image or sending one email needs a queue and a worker, not a workflow engine. See <a href="05-long-running-tasks.html">Managing Long-Running Tasks</a>.</li>
+    <li><strong>Short flows owned by one service.</strong> A hand-rolled, well-tested state machine with a status column is fine and cheaper to run.</li>
+    <li><strong>Data pipelines and batch ETL.</strong> Use a batch orchestrator such as Airflow; this pattern is about request-driven business processes.</li>
+    <li><strong>Steps that must be strictly isolated.</strong> If intermediate state must never be visible (a rare bank-internal ledger operation), keep the data in one database or one partition and use a real transaction instead of a saga.</li>
+    <li><strong>Premature infrastructure.</strong> If you can't state what a failure in the middle would cost, you probably don't need an engine yet. Say so, and name the signal (steps, duration, humans, compensation) that would change your mind.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"Checkout spans inventory, payments, shipping and a human in the warehouse, and it can take days, so I can't use one database transaction. I'll model it as an orchestrated saga: reserve inventory, charge the card, create the label, wait for the warehouse pick, then send the confirmation. Each step is a local transaction with a compensation, such as release stock, refund or void the label, run in reverse if something fails. The steps and compensations are idempotent using the order id as the idempotency key, and I'd use a transactional outbox for any events. Rather than hand-rolling status columns and cron jobs, I'd run this on Temporal or Step Functions, which persists each step, retries failures, sleeps for days for free, and takes the warehouse event as a signal. The risks I'd call out are lack of isolation, so I show a pending state and use semantic locks, and compensations that can't fully undo, which I'd handle with a manual queue."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>Why use a saga rather than two-phase commit, and what do you give up?</summary>
+    <div class="answer">
+      <p>2PC holds locks across all participants while a coordinator decides, blocks if the coordinator fails, needs every system to support XA (third-party APIs and most NoSQL stores don't), and cannot span multi-day human steps. A saga commits local transactions independently and uses compensations to reverse on failure, which keeps services autonomous and available. You give up isolation: other transactions can observe intermediate state, so you add semantic locks, pending states, commutative updates and version checks, and you must write and operate compensations.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you guarantee the card is charged exactly once?</summary>
+    <div class="answer">
+      <p>You can't get true exactly-once delivery, but you get exactly-once <em>effect</em>. Generate a stable idempotency key (order id plus step) and send it with the charge request. The payment provider stores key and result, and returns the original result for repeats. The workflow engine then may retry the activity as often as it likes. For a timeout with unknown outcome, retry with the same key or query the provider by that key before deciding. Add a unique constraint on your own side (for example one successful charge per order) as a second guard.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>The worker running the workflow crashes in the middle. What happens?</summary>
+    <div class="answer">
+      <p>Nothing is lost, because state lives in the engine's event history rather than in the worker. The engine notices the task timed out and hands it to another worker. That worker replays the workflow function against the recorded history: activities that already completed return their stored results immediately, so they are not re-run, and execution continues from the first step without a result. An activity that was in flight when the crash happened is retried, which is why it must be idempotent.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Why does workflow code have to be deterministic?</summary>
+    <div class="answer">
+      <p>Recovery works by re-running the code and matching each call to the recorded history. If the code takes a different branch on replay (because of a random number, the current time, an unordered map iteration or a changed code path), the engine can no longer line the code up with the history and raises a non-determinism error. So all non-deterministic or side-effecting work goes into activities, and time, randomness and sleeping go through the engine's APIs. Changing workflow code for in-flight executions needs explicit versioning for the same reason.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>What if a compensation itself fails?</summary>
+    <div class="answer">
+      <p>Compensations must not be allowed to fail permanently. Make them idempotent and simple, retry them with backoff indefinitely, and alert if they exceed a threshold. If a compensation is blocked by something a retry can't fix (account closed, provider contract issue), the saga moves to a manual-intervention state with all context in its history so a human can resolve it. Never silently drop a failed compensation. Designing steps so the expensive, risky operations come late reduces how many compensations are ever needed.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Orchestration or choreography for this checkout, and why?</summary>
+    <div class="answer">
+      <p>Orchestration. The flow has four or more steps, a human wait, timers and compensation, and the business needs a single answer to "where is order X?". An orchestrator (backed by a durable engine) keeps the flow in one readable place and avoids cyclic event dependencies. Choreography is reasonable for a tiny saga of two or three steps between services that already publish events, but it gets hard to follow and debug as steps are added. Even in an orchestrated design, services can still publish domain events for other consumers such as analytics.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="03-contention.html">03 · Dealing with Contention (2PC, distributed locks, OCC)</a></li>
+    <li><a href="05-long-running-tasks.html">05 · Managing Long-Running Tasks</a></li>
+    <li><a href="06-real-time-updates.html">06 · Real-Time Updates (pushing order status)</a></li>
+    <li><a href="04-large-blobs.html">04 · Handling Large Blobs (upload pipeline)</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>

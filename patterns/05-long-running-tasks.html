@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Long-Running Tasks — System Design Patterns</title>
+<meta name="description" content="How to move slow work out of the request path: job queues, workers, status APIs, retries, dead-letter queues, idempotency and autoscaling, plus when not to go async at all.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="05" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 05 of 08</span>
+  <h1>Long-Running Tasks</h1>
+  <p class="lede">Some work simply takes too long to finish inside one HTTP request. Instead of making the user wait, the API records the job, puts it on a queue and replies immediately, while a separate pool of workers does the slow part in the background.</p>
+  <div class="meta">
+    <span class="chip">Job queues</span>
+    <span class="chip">Worker pools</span>
+    <span class="chip">Retries &amp; DLQ</span>
+    <span class="chip">Idempotency</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p>If an operation takes more than a few seconds, or is unpredictable in duration, <strong>split the request in two</strong>: a fast <em>accept</em> step and a slow <em>do the work</em> step, connected by a queue.</p>
+  <ol>
+    <li><strong>The API server</strong> validates the request, writes a job record, puts a message on a queue and returns a <strong>job ID</strong> in milliseconds (HTTP <code>202 Accepted</code>).</li>
+    <li><strong>A worker pool</strong> pulls jobs off the queue and processes them at its own pace. Workers scale independently of the web tier (small cheap machines for the API, big GPU boxes for transcoding).</li>
+    <li><strong>The client</strong> checks progress by polling <code>GET /jobs/{id}</code> (or gets notified by webhook or push) and fetches the result when the job succeeds.</li>
+    <li><strong>Make it reliable:</strong> queues deliver at-least-once, so handlers must be <strong>idempotent</strong>; failed jobs <strong>retry with exponential backoff and jitter</strong>; jobs that keep failing land in a <strong>dead-letter queue (DLQ)</strong> so one bad input is not retried forever.</li>
+  </ol>
+  <p>The most common mistake is the opposite one: going async for work that takes 200 milliseconds. The synchronous version is far simpler and the user gets the answer immediately. Reach for this pattern only when the work genuinely does not fit in a request.</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>The prompt mentions video transcoding, image or document processing, report or PDF generation, bulk exports, or ML inference/training.</li>
+      <li>Something must be sent to millions of people (newsletters, push notifications, email campaigns).</li>
+      <li>The operation calls a slow or flaky third party (payment processor, email provider, web crawler).</li>
+      <li>A step is "after the upload, we then process the file" (see <a href="04-large-blobs.html">Handling Large Blobs</a>).</li>
+      <li>You hear "this takes minutes," "the request times out," or "users shouldn't have to wait."</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>Picture a running app called <strong>Stride</strong> that builds every user a year-in-review PDF. Rendering one means pulling twelve months of activity, drawing maps and charts, and laying out a document. Say it takes about 90 seconds.</p>
+  <p>If the API server does that inside the request, three things go wrong:</p>
+  <ul>
+    <li><strong>Timeouts cut the connection.</strong> Load balancers and gateways have idle or request timeouts (AWS ALB defaults to 60 seconds, API Gateway REST APIs cap at roughly 29 seconds, and many proxies and browsers give up somewhere between 30 and 120 seconds). The caller sees a 504 even though the server keeps working.</li>
+    <li><strong>The work is wasted and the server stays busy.</strong> Nobody is listening for the response any more, but the CPU is still burning on it. The user retries, which starts a second copy of the same expensive job.</li>
+    <li><strong>One slow request starves everything else.</strong> A server has a limited number of threads, workers or connections. A few hundred 90-second requests can occupy all of them, so cheap requests like "load my profile" start failing too. The web tier now needs the hardware of the most expensive operation.</li>
+  </ul>
+  <p>Other, less visible, problems: you cannot deploy or restart a server without killing in-flight work, you cannot absorb a traffic spike (every request must be served right now or fail), and a flaky downstream dependency turns directly into user-facing errors.</p>
+
+  <div class="callout interview">
+    <span class="callout-title">The core idea in one sentence</span>
+    <p>Decouple <em>accepting</em> work from <em>doing</em> work. The user needs an acknowledgement quickly; they do not need the result quickly, and the system does not need to produce it at the moment of the request.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>Any design with a heavy, slow or bursty step. Typical prompts:</p>
+  <ul>
+    <li><strong>YouTube / Netflix / Dropbox:</strong> transcode an uploaded video into many resolutions, generate thumbnails, scan for malware.</li>
+    <li><strong>Report and export features:</strong> "download all my data," CSV exports of millions of rows, analytics reports.</li>
+    <li><strong>Email, SMS and push at scale:</strong> newsletters, notification fan-out, digest emails.</li>
+    <li><strong>Web crawler:</strong> fetching and parsing pages is slow, rate-limited and failure-prone.</li>
+    <li><strong>Payments and order fulfilment:</strong> calling card networks, shipping providers, third-party APIs with their own latency.</li>
+    <li><strong>ML and AI features:</strong> inference on large inputs, batch embedding, model training.</li>
+    <li><strong>Any place the prompt says "and then process it."</strong> Often the follow-on from file upload.</li>
+  </ul>
+
+  <h3>Sync or async? The decision rule</h3>
+  <p>There is no universal cutoff, but a useful rule of thumb:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Expected duration</th><th>Default approach</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Under ~1 second (typically up to a few hundred ms)</td><td>Do it inline in the request</td><td>Simplest thing that works. The user gets the result immediately and there is no job state to manage.</td></tr>
+        <tr><td>~1 to 10 seconds</td><td>Judgement call. Inline with a spinner is often fine; go async if it is variable, spiky or CPU-heavy.</td><td>Still below most timeouts, but it ties up a server thread per request and p99 can blow past the limit.</td></tr>
+        <tr><td>Over ~10 to 30 seconds, or unbounded</td><td>Async job</td><td>Gets close to load balancer, gateway and browser timeouts, and the client is probably not going to sit there.</td></tr>
+        <tr><td>Minutes to hours</td><td>Async job with progress, checkpoints and retries</td><td>Long enough that workers will crash, deploy or be preempted mid-job.</td></tr>
+        <tr><td>Hours to days, many dependent steps</td><td>Workflow engine (see <a href="07-multi-step-processes.html">Multi-Step Processes</a>)</td><td>You need durable state, timers, human steps and compensation, not just a queue.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Duration is not the only input. Go async sooner when the work is <strong>CPU or memory heavy</strong>, depends on an <strong>unreliable third party</strong>, <strong>needs retries</strong>, arrives in <strong>bursts</strong>, or must <strong>survive a server restart</strong>. Stay synchronous when the user cannot proceed without the answer and it is fast (for example, validating a coupon code at checkout).</p>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>Start with the smallest design that removes the work from the request path, then add reliability and scale only as the requirements demand. Each step below builds on the one before it.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Reach for it when…</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Queue + worker pool</td><td>Work is too slow or heavy for a request</td><td>A new moving part; results are no longer immediate</td></tr>
+        <tr><td>2</td><td>Job record + status API</td><td>Users need to know what happened</td><td>Job table, polling or push, state transitions</td></tr>
+        <tr><td>3</td><td>Safe delivery: ack, visibility timeout, idempotency</td><td>Workers crash; duplicates will happen</td><td>Handlers must be written idempotently</td></tr>
+        <tr><td>4</td><td>Retries, backoff, DLQ</td><td>Failures are common or inputs can be bad</td><td>Retry storms if done badly; DLQ needs an owner</td></tr>
+        <tr><td>5</td><td>Scale workers: autoscaling, pools, priorities, limits</td><td>Load is bursty or job types differ</td><td>Tuning, cost, noisy-neighbour risk</td></tr>
+        <tr><td>6</td><td>Chunking, checkpoints, graceful shutdown</td><td>Single jobs run for many minutes or hours</td><td>Fan-out/fan-in bookkeeping</td></tr>
+        <tr><td>7</td><td>Scheduling, then workflow engines</td><td>Delayed, recurring or multi-step work</td><td>Another platform to run and learn</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="step">Step 1</span>Queue plus worker pool</h3>
+  <p>Put a <strong>message queue</strong> between the thing that accepts requests and the thing that does the work. The API server does the cheap, bounded part: authenticate, validate, store a job record, enqueue a message and return. A separate fleet of <strong>workers</strong> (processes that loop forever, pulling a message, doing the work, acknowledging it) does the expensive part.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 770 300" role="img" aria-label="Architecture: client sends a request to the API, which writes a job record and enqueues a message; workers pull from the queue, write results to a result store and update the job store; failed messages go to a dead-letter queue">
+      <rect class="n" x="5" y="90" width="90" height="56" rx="8"/><text class="t t-mid" x="50" y="123">Client</text>
+      <rect class="n-a" x="125" y="90" width="100" height="56" rx="8"/><text class="t t-mid" x="175" y="123">API server</text>
+      <rect class="n-w" x="265" y="90" width="100" height="56" rx="8"/><text class="t t-mid" x="315" y="123">Queue</text>
+      <rect class="n-a" x="405" y="90" width="110" height="56" rx="8"/><text class="t t-mid" x="460" y="123">Worker pool</text>
+      <rect class="n-g" x="575" y="90" width="110" height="56" rx="8"/><text class="t t-mid" x="630" y="123">Result store</text>
+      <rect class="n-b" x="265" y="10" width="100" height="44" rx="8"/><text class="t t-mid" x="315" y="37">DLQ</text>
+      <rect class="n-g" x="125" y="190" width="100" height="50" rx="8"/><text class="t t-mid" x="175" y="220">Job store</text>
+
+      <line class="l-a" x1="95" y1="106" x2="123" y2="106" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="109" y="98">1</text>
+      <line class="l-a" x1="123" y1="130" x2="97" y2="130" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="110" y="146">2</text>
+      <line class="l-a" x1="225" y1="118" x2="263" y2="118" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="244" y="110">3</text>
+      <line class="l-a" x1="403" y1="118" x2="367" y2="118" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="385" y="110">4</text>
+      <line class="l-g" x1="515" y1="118" x2="573" y2="118" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="544" y="110">5</text>
+      <path class="l-g" d="M460 146 V215 H227" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="345" y="208">6</text>
+      <line class="l" x1="175" y1="148" x2="175" y2="188" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <text class="t-s" x="183" y="172">1b / 7</text>
+      <line class="l-b dash" x1="315" y1="88" x2="315" y2="56" marker-end="url(#arrow)"/>
+      <text class="t-s" x="323" y="76">max retries</text>
+
+      <text class="t-s" x="5" y="264">1 POST /jobs   1b API writes job row (queued) + enqueues   2 return 202 + job id   3 enqueue message   4 worker pulls</text>
+      <text class="t-s" x="5" y="282">5 write output   6 mark succeeded / failed   7 client polls GET /jobs/id, which reads the job store</text>
+    </svg>
+    <figcaption>The core architecture. The request path (1 to 3) is fast; the slow path (4 to 6) happens off to the side and scales on its own.</figcaption>
+  </figure>
+
+  <h4>Why this helps</h4>
+  <ul>
+    <li><strong>Fast, predictable API latency.</strong> The request only validates and enqueues, so it returns in milliseconds no matter how heavy the work is.</li>
+    <li><strong>Independent scaling.</strong> Web servers are small, cheap and stateless. Workers can be big, memory-rich or GPU-equipped machines, and you can run as many or as few as you want.</li>
+    <li><strong>Burst absorption.</strong> The queue is a buffer. A spike of 100,000 jobs piles up in the queue instead of crashing the system, and workers drain it at a steady rate (see <a href="02-scaling-writes.html">Scaling Writes</a>).</li>
+    <li><strong>Failure isolation.</strong> If workers die or a downstream service is slow, the API keeps accepting work. Deploys and restarts do not drop jobs, because they live in the queue.</li>
+    <li><strong>Pull-based flow control.</strong> Workers take work only when they have capacity, so they are never overwhelmed the way a push-based design could be.</li>
+  </ul>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Fast responses and no timeouts</li>
+      <li>Workers scale separately from the web tier</li>
+      <li>Spikes are smoothed out by the queue</li>
+      <li>Work survives deploys and crashes</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Result is not immediate; the UX needs a pending state</li>
+      <li>More infrastructure to run and monitor</li>
+      <li>Duplicates and retries become your problem</li>
+      <li>Harder to debug than a single stack trace</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 2</span>A job record and a status API</h3>
+  <p>A queue message vanishes once consumed, so the system needs a durable <strong>job record</strong> the user can ask about. When the API accepts a request it inserts a row, then enqueues the job ID. Workers update that row as they go.</p>
+
+<pre><code>jobs
+  id            uuid  primary key
+  type          text            -- 'year_in_review_pdf'
+  status        text            -- queued | running | succeeded | failed | canceled
+  params        jsonb           -- inputs, or a pointer to them
+  progress      int             -- 0..100, optional
+  attempts      int             -- how many times it has been tried
+  result_url    text            -- where the output lives (e.g. an object-store key)
+  error         text            -- last failure reason
+  idempotency_key text unique   -- dedupes client retries of POST
+  created_at, started_at, finished_at, updated_at  timestamptz</code></pre>
+
+  <h4>API shape</h4>
+  <p>Return <strong>202 Accepted</strong> (not 200 or 201): the request was understood and queued, but the work is not done. Include the job ID in the body and a <code>Location</code> header pointing at the status resource.</p>
+<pre><code>POST /v1/reports
+Idempotency-Key: 7f3c9a1e-...
+{ "user_id": 42, "year": 2025 }
+
+HTTP/1.1 202 Accepted
+Location: /v1/jobs/9b1d...
+Retry-After: 5
+{ "job_id": "9b1d...", "status": "queued" }
+
+GET /v1/jobs/9b1d...
+200 OK
+{ "job_id": "9b1d...", "status": "running", "progress": 60 }
+{ "job_id": "9b1d...", "status": "succeeded",
+  "result_url": "https://cdn.example.com/reports/9b1d.pdf" }</code></pre>
+
+<pre><code>def create_report(req):
+    key = req.headers["Idempotency-Key"]
+    job = db.insert_or_get(jobs, idempotency_key=key,        # unique index: same key
+                           type="year_in_review_pdf",        # returns the same job
+                           params=req.json, status="queued")
+    if job.is_new:
+        queue.send({"job_id": job.id})                       # see "outbox" note below
+    return Response(202, {"job_id": job.id, "status": "queued"},
+                    headers={"Location": f"/v1/jobs/{job.id}"})</code></pre>
+
+  <div class="callout warn">
+    <span class="callout-title">The dual-write gap</span>
+    <p>"Insert the row, then enqueue" is two separate writes. If the process dies between them you have a job that never runs. Fixes: use the <strong>transactional outbox</strong> pattern (write the job row and an outbox row in one database transaction, and a relay publishes outbox rows to the queue), or run a periodic sweeper that re-enqueues jobs stuck in <code>queued</code> for too long. Workers must tolerate the occasional duplicate this causes, which is the next step.</p>
+  </div>
+
+  <h4>How does the client find out? Polling, webhooks or push</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>How it works</th><th>Use when</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td>Polling</td><td>Client calls <code>GET /jobs/{id}</code> every few seconds. Use the <code>Retry-After</code> header or back off (1s, 2s, 4s, capped) so you do not hammer the API.</td><td>Default. Simple, works everywhere, great for a progress bar.</td><td>Wasted requests; latency up to one poll interval; many clients polling at once adds load.</td></tr>
+        <tr><td>Webhook</td><td>Client registers a URL; the system POSTs the result there when done.</td><td>Server-to-server integrations (payment providers do this).</td><td>Receiver must be reachable, verify a signature, and handle retries and duplicates. Not usable from a browser.</td></tr>
+        <tr><td>Push (WebSocket, SSE, mobile push)</td><td>Server pushes "job done" over a live connection or a push notification.</td><td>Users are watching the screen and want instant updates.</td><td>Connection management at scale. See <a href="06-real-time-updates.html">Real-Time Updates</a>.</td></tr>
+        <tr><td>Email / notification</td><td>Tell the user later: "your report is ready."</td><td>Very long jobs; the user has left the page.</td><td>Still keep the status API as the source of truth.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Whatever the notification channel, keep <code>GET /jobs/{id}</code> as the source of truth: a missed webhook or dropped WebSocket must never leave a user stuck. Also make job results expire (delete after N days) and enforce authorization, so one user cannot read another user's job by guessing an ID.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 770 260" role="img" aria-label="Job lifecycle state machine: queued to running to succeeded, with retry wait loop, visibility-timeout return to queued, and failed state for fatal errors or exhausted retries">
+      <rect class="n-a" x="20" y="80" width="100" height="50" rx="8"/><text class="t t-mid" x="70" y="110">queued</text>
+      <rect class="n-w" x="210" y="80" width="110" height="50" rx="8"/><text class="t t-mid" x="265" y="110">running</text>
+      <rect class="n-g" x="520" y="30" width="130" height="50" rx="8"/><text class="t t-mid" x="585" y="60">succeeded</text>
+      <rect class="n-b" x="520" y="130" width="130" height="50" rx="8"/><text class="t t-mid" x="585" y="160">failed (to DLQ)</text>
+      <rect class="n" x="190" y="190" width="150" height="50" rx="8"/><text class="t t-mid" x="265" y="220">retry wait</text>
+
+      <line class="l-a" x1="120" y1="105" x2="208" y2="105" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="164" y="97">claimed</text>
+      <line class="l-g" x1="320" y1="92" x2="518" y2="58" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="440" y="62">success</text>
+      <line class="l-b" x1="320" y1="118" x2="518" y2="152" marker-end="url(#arrow)"/>
+      <text class="t-b t-mid" x="425" y="160">fatal error or out of retries</text>
+      <line class="l" x1="265" y1="132" x2="265" y2="188" marker-end="url(#arrow)"/>
+      <text class="t-s" x="275" y="164">transient error</text>
+      <path class="l" d="M190 215 H70 V132" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="130" y="207">after backoff + jitter</text>
+      <path class="l dash" d="M265 78 V48 H70 V78" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="167" y="40">worker died: visibility timeout expires</text>
+    </svg>
+    <figcaption>Job lifecycle. The dashed edge is the safety net: if a worker vanishes without reporting, the message reappears and another worker takes the job.</figcaption>
+  </figure>
+
+  <h3><span class="step">Step 3</span>Safe delivery: acks, visibility timeouts and idempotency</h3>
+  <p>The hard part of a job queue is not moving messages around. It is deciding what happens when something goes wrong halfway through. The answer is built from three ideas: an <strong>acknowledgement</strong>, a <strong>visibility timeout</strong> and an <strong>idempotent handler</strong>.</p>
+
+  <h4>Delivery guarantees</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Guarantee</th><th>Mechanics</th><th>Failure mode</th><th>Fits</th></tr></thead>
+      <tbody>
+        <tr><td>At-most-once</td><td>Remove the message from the queue <em>before</em> (or as) it is processed.</td><td>Worker crashes mid-job: the job is lost forever.</td><td>Best-effort, droppable work (metrics, cache warming).</td></tr>
+        <tr><td>At-least-once</td><td>Remove the message only <em>after</em> the work succeeds (ack). If no ack arrives, redeliver.</td><td>Worker finishes but dies before acking, or is merely slow: the job runs twice.</td><td>The default for real work. Pair it with idempotency.</td></tr>
+        <tr><td>"Exactly-once"</td><td>In practice: at-least-once delivery <em>plus</em> idempotent processing, so duplicates have no extra effect.</td><td>Any side effect outside your transaction boundary (an email, a charge) can still repeat unless you dedupe it.</td><td>Payments, billing, anything where a duplicate is harmful.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Be careful with the phrase "exactly-once." Brokers can dedupe sends within a window (SQS FIFO does this for a few minutes) and Kafka offers transactions that give exactly-once semantics <em>within Kafka</em>, but once a worker calls an external system, the network can fail after the call succeeds, and the only defence is making that call safe to repeat. In an interview say: "the queue gives at-least-once; I make the handler idempotent so the effect is exactly-once."</p>
+
+  <h4>Ack, nack and the visibility timeout</h4>
+  <p>In SQS-style queues a received message is not deleted; it becomes <em>invisible</em> for a configurable <strong>visibility timeout</strong> (default 30 seconds in SQS, maximum 12 hours). Three outcomes follow:</p>
+  <ul>
+    <li><strong>Ack (delete):</strong> the worker finished, so it deletes the message. Done.</li>
+    <li><strong>Nack / release:</strong> the worker knows it failed (RabbitMQ <code>basic.nack</code>, or set the visibility timeout to 0 in SQS) so the message goes back for another attempt, ideally after a delay.</li>
+    <li><strong>Silence:</strong> the worker crashed or hung. When the timeout expires the message becomes visible again and another worker picks it up. This is the self-healing mechanism, and also the source of duplicates.</li>
+  </ul>
+  <p>Set the timeout comfortably above the normal job duration. Too short and healthy slow jobs get redelivered to a second worker while the first is still running. Too long and a crashed worker's job sits idle for ages before anyone retries it.</p>
+
+  <h4>Heartbeats for long jobs</h4>
+  <p>When job duration is variable, do not guess a huge timeout. Use a short one and have the worker <strong>heartbeat</strong>: periodically extend the lease while it is still alive (SQS <code>ChangeMessageVisibility</code>, RabbitMQ consumer heartbeats and a delivery timeout, Temporal activity heartbeats, a <code>locked_until</code> column that workers keep bumping). A crashed worker stops heartbeating, so its job is reclaimed within seconds, not hours.</p>
+
+  <h4>Why duplicates really happen</h4>
+  <ul>
+    <li>The worker finished but crashed or lost the network before the ack arrived.</li>
+    <li>The visibility timeout expired during a legitimately slow job and the message was redelivered while the first worker was still going.</li>
+    <li>A deploy or autoscaler killed the worker mid-job.</li>
+    <li>The API retried the enqueue after a timeout, or a client double-clicked or retried the POST.</li>
+    <li>The broker itself redelivered after a failover or partition rebalance.</li>
+  </ul>
+  <p>Duplicates are not a bug to eliminate. They are a property to design for.</p>
+
+  <h4>Making handlers idempotent</h4>
+  <p>An operation is <strong>idempotent</strong> if doing it twice has the same effect as doing it once. Techniques:</p>
+  <ul>
+    <li><strong>Idempotency key on the request.</strong> The client sends a unique key with the POST; the API enforces a unique constraint so the same key returns the same job instead of creating a new one.</li>
+    <li><strong>Check state before acting.</strong> Look up the job; if it is already <code>succeeded</code>, just ack and move on.</li>
+    <li><strong>Claim with compare-and-set.</strong> <code>UPDATE jobs SET status='running', worker=? WHERE id=? AND status='queued'</code> so only one worker wins. Extend this with a lease (<code>locked_until</code>) so a dead worker's claim can be taken over.</li>
+    <li><strong>Deterministic outputs.</strong> Write the result to a key derived from the job ID (<code>reports/{job_id}.pdf</code>) so a rerun overwrites the same object instead of creating a second one.</li>
+    <li><strong>Dedupe table for side effects.</strong> Record <code>(job_id, step)</code> in a unique-indexed table in the same transaction as the effect, or pass the job ID as an idempotency key to the downstream API (Stripe and most payment APIs support this).</li>
+    <li><strong>Prefer set over increment.</strong> "Set status to shipped" is idempotent; "add 1 to the counter" is not.</li>
+  </ul>
+
+  <h4>A worker loop</h4>
+<pre><code>while not shutting_down:
+    msgs = queue.receive(max_messages=1, wait_seconds=20,   # long polling
+                         visibility_timeout=120)
+    for m in msgs:
+        job = db.get_job(m.job_id)
+        if job.status in ("succeeded", "canceled"):          # duplicate delivery
+            queue.ack(m); continue
+        if not db.claim(job.id, lease_seconds=120):          # compare-and-set
+            continue                                         # someone else owns it
+
+        try:
+            with heartbeat(m, every=60, extend_by=120):      # keep the lease alive
+                out_key = f"reports/{job.id}.pdf"            # deterministic output
+                render_pdf(job.params, out_key)              # may take minutes
+            db.finish(job.id, "succeeded", result_url=url_for(out_key))
+            queue.ack(m)                                     # delete only after success
+        except RetryableError:
+            queue.release(m, delay=backoff(m.receive_count)) # nack with a delay
+        except FatalError as e:
+            db.finish(job.id, "failed", error=str(e))
+            queue.ack(m)                                     # no point retrying</code></pre>
+
+  <h3><span class="step">Step 4</span>Retries, backoff and dead-letter queues</h3>
+  <p>Failures are normal at this scale: a dependency times out, a rate limit trips, a spot instance disappears. The system should retry the failures that might succeed next time and quarantine the ones that never will.</p>
+
+  <h4>Retryable versus non-retryable errors</h4>
+  <ul>
+    <li><strong>Retry:</strong> timeouts, connection resets, HTTP 429 and 5xx, deadlocks, lease or lock conflicts, "dependency temporarily unavailable."</li>
+    <li><strong>Do not retry:</strong> validation errors, HTTP 4xx like 400 or 404, a corrupt or unsupported file, permission errors, or a bug that will throw the same exception every time. Retrying these only wastes capacity and delays the real fix.</li>
+  </ul>
+
+  <h4>Exponential backoff with jitter</h4>
+  <p>Do not retry immediately and do not retry on a fixed interval. If a dependency is struggling, hammering it makes things worse, and if thousands of jobs failed at the same moment they will all retry at the same moment too, causing a <em>retry storm</em>.</p>
+<pre><code>delay = min(cap, base * 2 ** attempt)     # 1s, 2s, 4s, 8s ... capped at, say, 5 min
+delay = random.uniform(0, delay)          # "full jitter": spread retries out</code></pre>
+  <p>Jitter randomizes the delay so retries spread across time instead of arriving as a wave. Also set a <strong>maximum attempt count</strong> (commonly 3 to 10), and consider a <strong>circuit breaker</strong> or retry budget so that when a dependency is clearly down, workers stop hammering it and pause the queue instead.</p>
+  <p>How you implement the delay depends on the broker: SQS has per-message delay (up to 15 minutes) and visibility timeouts; RabbitMQ commonly uses a TTL'd "wait" queue that dead-letters back to the work queue; BullMQ, Sidekiq and Celery have built-in attempts and backoff settings; Cloud Tasks has configurable retry policies natively.</p>
+
+  <h4>Poison messages and the dead-letter queue</h4>
+  <p>A <strong>poison message</strong> is one that can never succeed: a corrupted video, a malformed payload, a job that triggers a crash. Without a limit, it gets redelivered forever, burns worker capacity and can block messages behind it (especially in ordered or partitioned systems). Worse, a poison message that kills the worker outright (an out-of-memory crash) never gets a chance to report its own failure.</p>
+  <p>The fix is a <strong>dead-letter queue (DLQ)</strong>: after a message has been received more than <code>maxReceiveCount</code> times (SQS calls it exactly that), the broker moves it to a separate queue. Counting deliveries at the broker is important because it works even when the worker crashes before it can say anything.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 -20 770 290" role="img" aria-label="Retry and dead-letter flow: worker success acks, transient failure waits with backoff and returns to the queue, exhausted or fatal failures go to the dead-letter queue, alert a human, and are redriven after a fix">
+      <rect class="n-w" x="20" y="70" width="110" height="50" rx="8"/><text class="t t-mid" x="75" y="100">Main queue</text>
+      <rect class="n-a" x="210" y="70" width="110" height="50" rx="8"/><text class="t t-mid" x="265" y="100">Worker</text>
+      <rect class="n-g" x="420" y="20" width="130" height="44" rx="8"/><text class="t t-mid" x="485" y="47">ack: done</text>
+      <rect class="n" x="190" y="160" width="150" height="44" rx="8"/><text class="t t-mid" x="265" y="187">backoff + jitter</text>
+      <rect class="n-b" x="590" y="70" width="150" height="50" rx="8"/><text class="t t-mid" x="665" y="100">Dead-letter queue</text>
+      <rect class="n-w" x="590" y="160" width="150" height="44" rx="8"/><text class="t t-mid" x="665" y="187">Alert + investigate</text>
+
+      <line class="l" x1="130" y1="95" x2="208" y2="95" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="320" y1="82" x2="418" y2="52" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="378" y="56">ok</text>
+      <line class="l" x1="265" y1="122" x2="265" y2="158" marker-end="url(#arrow)"/>
+      <text class="t-s" x="275" y="146">transient</text>
+      <path class="l" d="M190 182 H75 V122" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="132" y="174">retry</text>
+      <line class="l-b" x1="320" y1="100" x2="588" y2="100" marker-end="url(#arrow)"/>
+      <text class="t-b t-mid" x="454" y="92">attempts &gt;= max, or fatal</text>
+      <line class="l-b" x1="665" y1="122" x2="665" y2="158" marker-end="url(#arrow)"/>
+      <path class="l dash" d="M665 68 V8 H75 V68" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="370" y="0">redrive back to the main queue once the bug is fixed</text>
+
+      <text class="t-s" x="20" y="238">Retries handle transient failures. The DLQ quarantines poison messages so they stop consuming capacity.</text>
+      <text class="t-s" x="20" y="256">Alert when the DLQ depth is above zero; otherwise it silently becomes a graveyard.</text>
+    </svg>
+    <figcaption>Retry and DLQ flow. The broker counts deliveries, so even a message that crashes the worker eventually lands in the DLQ.</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>Alert on it.</strong> A DLQ nobody watches is a silent data-loss bug. Alarm on queue depth above zero or on the age of the oldest message.</li>
+    <li><strong>Keep context.</strong> Store the error, stack trace, attempt count and original payload so someone can diagnose it.</li>
+    <li><strong>Redrive.</strong> After fixing the bug, replay DLQ messages back to the main queue (SQS has a built-in redrive feature). Idempotent handlers make this safe.</li>
+    <li><strong>Mind retention.</strong> In SQS the retention clock counts from the original enqueue time, so give the DLQ a longer retention period than the source queue.</li>
+    <li><strong>Ordered queues are special.</strong> In FIFO queues or Kafka partitions, one stuck message blocks everything behind it. Common practice is to move failed messages to a retry topic or DLQ so the main stream keeps flowing.</li>
+    <li>Update the job row to <code>failed</code> with a user-readable error so the user is not left staring at "running."</li>
+  </ul>
+
+  <h3><span class="step">Step 5</span>Scaling the workers: pools, priorities, limits and autoscaling</h3>
+
+  <h4>Separate worker pools per job type</h4>
+  <p>Different jobs have different resource profiles and failure modes. Give each its own queue and its own worker fleet:</p>
+  <ul>
+    <li>Video transcoding needs GPUs or many CPU cores; sending email needs almost nothing but many concurrent connections; PDF rendering may need lots of memory.</li>
+    <li>A flood of low-value jobs (a million newsletter emails) must not starve a high-value one (a password-reset email). Separate queues give you <strong>isolation</strong> and let you size and scale each pool independently.</li>
+    <li>Workers can be deployed, versioned and rolled back separately from the API.</li>
+  </ul>
+
+  <h4>Priorities</h4>
+  <p>Most brokers do not have great built-in priority support, so the usual approach is <strong>multiple queues</strong> (<code>critical</code>, <code>default</code>, <code>bulk</code>) with workers that poll the high-priority queue first, or a weighted share of workers per queue (Sidekiq and Celery both support this). Watch for starvation of the lowest tier and consider aging or a minimum share. RabbitMQ also supports per-queue priority levels natively, with a modest cost.</p>
+
+  <h4>Concurrency limits and rate limiting</h4>
+  <p>Workers can overwhelm whatever they call. If 500 workers all hit a third-party email API that allows 100 requests per second, you will get throttled and burn retries. Cap parallelism per worker and per job type, use a shared token-bucket rate limiter (for example in Redis), and respect <code>429</code> and <code>Retry-After</code>. Per-tenant limits keep one big customer from monopolizing the pool ("noisy neighbour").</p>
+
+  <h4>Backpressure and autoscaling</h4>
+  <p>The queue gives you a free backpressure signal. Do not scale on worker CPU; scale on the thing that actually measures unmet demand:</p>
+  <ul>
+    <li><strong>Queue depth</strong> (backlog per worker) and, better, <strong>age of the oldest message</strong>. Age directly measures how late jobs are running against your SLO.</li>
+    <li>Tools: <strong>KEDA</strong> on Kubernetes scales deployments from SQS, RabbitMQ, Kafka lag or Redis list length (and can scale to zero). AWS Auto Scaling groups or ECS services can scale on a "backlog per instance" CloudWatch metric. Lambda with an SQS trigger scales automatically up to a configured concurrency.</li>
+    <li><strong>Cap the scale-out</strong> to protect downstream databases and APIs; unbounded workers just move the bottleneck.</li>
+    <li>If producers still outrun the maximum capacity, protect the system: bound the queue, reject or shed low-priority work with a <code>429</code>/<code>503</code>, and tell clients to retry later. An unbounded backlog that is days long is a hidden outage.</li>
+  </ul>
+
+  <h3><span class="step">Step 6</span>Very long jobs: chunking, checkpoints and graceful shutdown</h3>
+  <p>A single job that runs for an hour is fragile: the longer it runs, the more likely a worker dies, a deploy rolls out or a spot instance is reclaimed, and restarting from zero wastes everything. Two strategies reduce that risk.</p>
+
+  <h4>Split into chunks: fan-out and fan-in</h4>
+  <p>A <strong>coordinator</strong> job breaks the work into many small, independent tasks (a video into 10-second segments, an export into 100,000-row pages, a newsletter into batches of 1,000 recipients) and enqueues each one. This is <strong>fan-out</strong>. Workers process chunks in parallel, so total time shrinks and a failure only costs one small chunk. When all chunks finish, a final step merges them: <strong>fan-in</strong> (concatenate segments, assemble the file, mark the parent job done). Track completion with a counter (atomic decrement of "chunks remaining") or by querying chunk rows. Each chunk must be idempotent and retried independently.</p>
+
+  <h4>Checkpointing</h4>
+  <p>If a job cannot be split, <strong>save progress periodically</strong> (a cursor, an offset, intermediate files in object storage) so a retry resumes where the last attempt stopped instead of restarting. This is the same idea as ML training checkpoints. Combine it with heartbeats so a stalled worker is detected quickly.</p>
+
+  <h4>Graceful shutdown and spot interruptions</h4>
+  <ul>
+    <li>Handle <code>SIGTERM</code>: stop pulling new messages, finish or checkpoint the current job, and exit. Kubernetes sends <code>SIGTERM</code> then <code>SIGKILL</code> after <code>terminationGracePeriodSeconds</code>, so set it long enough, or release the message so another worker picks it up right away.</li>
+    <li>Spot and preemptible instances are much cheaper but are reclaimed with short warning (AWS gives a two-minute notice). They are a good fit for workers precisely because jobs are retryable and idempotent. Watch for the notice, checkpoint and release the message.</li>
+    <li>Never ack before the work is durably finished, otherwise a kill during shutdown loses the job.</li>
+  </ul>
+
+  <h3><span class="step">Step 7</span>Scheduling, delays, and when to graduate to a workflow engine</h3>
+  <ul>
+    <li><strong>Delayed jobs:</strong> "send this reminder in 24 hours" or "retry in 5 minutes." Use per-message delays (SQS up to 15 minutes), delayed queues (BullMQ, Sidekiq's <code>perform_in</code>, RabbitMQ plugin), or a scheduler (Cloud Tasks, EventBridge Scheduler) for longer horizons. For arbitrarily distant times, store them in a table keyed by <code>run_at</code> and have a poller enqueue what is due.</li>
+    <li><strong>Recurring jobs (cron):</strong> nightly reports, cleanup. Run the scheduler as a single leader or use a distributed lock, otherwise every instance fires the job and you get N duplicates. Make the job itself idempotent anyway.</li>
+    <li><strong>Workflow engines:</strong> a queue is great for a single unit of work. Once the work is many dependent steps over hours or days, with branching, waiting for humans or external events, timers and compensation when a step fails, hand-rolling it on queues turns into a tangle of state machines. Use a durable workflow engine such as Temporal, AWS Step Functions or Airflow. See <a href="07-multi-step-processes.html">Multi-Step Processes</a>.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>Async processing buys you resilience and scale at the price of complexity. These are the failure modes interviewers probe.</p>
+
+  <h3>Complexity and the end of "just return the result"</h3>
+  <p>You now have a queue, a worker fleet, a job table, a status API and a UX for pending, failed and retried states. Every one of those can break and needs monitoring. This is the main reason not to use the pattern for fast work.</p>
+
+  <h3>Duplicate execution</h3>
+  <p>At-least-once delivery means a job can run more than once. If the handler sends an email or charges a card without idempotency, users get two emails or two charges. Use idempotency keys, deterministic outputs, state checks and dedupe tables as described in Step 3.</p>
+
+  <h3>Lost jobs</h3>
+  <p>Jobs vanish through the dual-write gap (row saved, message never sent), through acking before the work is complete, or through queues that are not durable (memory-only Redis lists without persistence, or auto-ack consumers). Use an outbox or a sweeper, ack after success and choose durable queues.</p>
+
+  <h3>Retry storms and amplification</h3>
+  <p>If every layer retries (client, API, worker, SDK), a brief outage multiplies into a flood. Use exponential backoff with jitter, retry limits, a retry budget or circuit breaker, and retry at one layer rather than all of them.</p>
+
+  <h3>Poison messages and head-of-line blocking</h3>
+  <p>Without a max receive count and a DLQ, a single bad message loops forever. In ordered queues it also blocks everything behind it. Use DLQs, and for ordered streams, a retry topic.</p>
+
+  <h3>Ordering and exactly-once expectations</h3>
+  <p>Standard queues (SQS Standard, RabbitMQ with multiple consumers) do not guarantee order, and retries reorder messages further. If order matters per entity (all events for one order), partition or group by key (SQS FIFO message group ID, Kafka partition key) and accept lower parallelism. Often it is better to design the handler to be order-tolerant, for example by comparing version numbers.</p>
+
+  <h3>Backlog and latency growth</h3>
+  <p>When arrivals exceed capacity, the queue grows without bound and every job gets later and later. Monitor queue age, autoscale, and shed or reject work at the edge before the backlog becomes unrecoverable. Note that a deep queue also means a retried job waits behind the whole backlog.</p>
+
+  <h3>Visibility timeout mistakes</h3>
+  <p>Too short causes duplicate concurrent execution; too long delays recovery. Use heartbeats to keep a short timeout that still survives long jobs.</p>
+
+  <h3>User experience</h3>
+  <p>Users need feedback: a visible "processing" state, progress, a clear failure message and a way to retry or cancel. Decide what the UI shows between submit and done, and what happens if the user navigates away (notify by email or push).</p>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <p>For the broader comparison of the work-queue model vs publish/subscribe, and a side-by-side of Kafka and RabbitMQ, see <a href="02-scaling-writes.html#messaging-models">Queues, pub/sub and brokers</a> in Scaling Writes.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Model</th><th>Fits when</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Amazon SQS</td><td>Managed queue. Standard (at-least-once, best-effort order, near-unlimited throughput) or FIFO (ordering per message group, dedupe).</td><td>You are on AWS and want a simple, durable, zero-ops work queue.</td><td>Built-in visibility timeout, delay, DLQ with maxReceiveCount and redrive. Max message size is 256 KB, so pass pointers to data. Pairs well with Lambda or ECS and autoscaling on queue age.</td></tr>
+        <tr><td>RabbitMQ</td><td>Broker with exchanges, routing, acks, per-message TTL, priorities.</td><td>You need flexible routing, priorities or low latency and can run a broker.</td><td>Push-based with consumer prefetch limits; dead-letter exchanges for retries and DLQ. Classic and quorum queues for durability.</td></tr>
+        <tr><td>Kafka</td><td>Distributed append-only log; consumer groups, partitions, offsets.</td><td>Very high throughput event streams, replay, ordering per key; jobs that are really "process each event."</td><td>Not a work queue by default: one partition goes to one consumer in a group, so parallelism is capped by partition count, and a slow or poison message blocks its partition. No per-message ack, delay or built-in DLQ; you build retry topics yourself. Great when you also need replay.</td></tr>
+        <tr><td>Redis-backed job libraries (BullMQ, Sidekiq, Celery with Redis, RQ, Resque)</td><td>Job frameworks on Redis lists or streams (or a database).</td><td>App-level background jobs with retries, delays, cron and a dashboard out of the box.</td><td>Easiest developer experience. Durability depends on Redis persistence and replication settings, so consider it carefully for critical work.</td></tr>
+        <tr><td>Google Cloud Tasks / Pub/Sub</td><td>Cloud Tasks pushes HTTP requests to your endpoint with rate and retry controls; Pub/Sub is a pub-sub bus with pull or push subscriptions.</td><td>On GCP; Cloud Tasks for targeted jobs with scheduling and rate limits, Pub/Sub for fan-out to many consumers.</td><td>Both have retry policies and dead-letter topics. Cloud Tasks supports scheduled delivery and per-queue rate limits natively.</td></tr>
+        <tr><td>Azure Service Bus</td><td>Enterprise broker with queues and topics, sessions, scheduled messages.</td><td>On Azure, or needing ordered sessions and transactions.</td><td>Built-in DLQ, peek-lock (its visibility-style lease), duplicate detection and scheduled delivery.</td></tr>
+        <tr><td>Workflow engines (Temporal, Step Functions)</td><td>Durable orchestration with state, timers and retries built in.</td><td>Multi-step, long-lived processes.</td><td>See <a href="07-multi-step-processes.html">Multi-Step Processes</a>. Heavier than a queue; use when the logic outgrows one job.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>For the job table itself, any durable database works (PostgreSQL, DynamoDB). Some systems skip the broker entirely and use the database as the queue with <code>SELECT ... FOR UPDATE SKIP LOCKED</code>; that is a legitimate choice at modest scale because it makes the job row and the queue transactional.</p>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <div class="callout warn">
+    <span class="callout-title">The most common mistake: going async too early</span>
+    <p>Many candidates reach for queues, workers and status endpoints the moment a diagram has a "processing" box. If the work takes <strong>around 200 milliseconds</strong>, just do it inside the request. The synchronous version has no job table, no polling, no retry logic, no duplicate handling and no failure states to explain, and the user gets the result immediately.</p>
+  </div>
+  <ul>
+    <li><strong>Fast work.</strong> Anything that reliably finishes in well under a second or two. Resizing a small avatar, validating input, computing a recommendation from cached data: do it inline. Adding a queue makes the user experience <em>worse</em> because they now wait for a poll.</li>
+    <li><strong>The user needs the answer to proceed.</strong> Login checks, price calculations at checkout, "is this username taken." Async only adds latency and a pending state.</li>
+    <li><strong>You cannot make the work idempotent.</strong> If a duplicate would be harmful and you have no way to dedupe, fix that first or keep it synchronous with a transaction.</li>
+    <li><strong>Low and steady volume.</strong> If you do a handful of jobs a day, a scheduled script or a thread in the web process might be enough.</li>
+    <li><strong>The slowness is a symptom.</strong> If an endpoint is slow because of a missing index or an N+1 query, fix that rather than hiding it behind a queue (see <a href="01-scaling-reads.html">Scaling Reads</a>).</li>
+    <li><strong>The work is a long chain of dependent steps.</strong> Reach for a workflow engine, not a pile of queues. See <a href="07-multi-step-processes.html">Multi-Step Processes</a>.</li>
+  </ul>
+  <p>A good habit: state your estimate out loud, "this takes about 200 ms, so I'll do it inline; if it grew to minutes I'd move it to a queue." That shows judgement, not just vocabulary.</p>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"Transcoding takes minutes, far longer than a load balancer timeout, so I won't do it in the request. The API will validate the upload, write a job row with status queued, put the job ID on an SQS queue and return 202 with the job ID right away. A separate pool of GPU workers pulls from the queue and does the transcoding, and I can scale that pool on queue age without touching the web tier. The client polls a status endpoint, or gets a push notification when it's done. Since the queue is at-least-once, I'll make the handler idempotent, writing outputs to a key derived from the job ID, and use a visibility timeout with heartbeats so a crashed worker's job gets picked up by another. Failures retry with exponential backoff and jitter, and after a few attempts the message goes to a dead-letter queue with an alarm, so one corrupted file isn't retried forever. And if this were a 200-millisecond operation, I wouldn't do any of this; I'd keep it synchronous."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>How do you guarantee a job runs exactly once?</summary>
+    <div class="answer">
+      <p>You do not, at the queue level. Queues give at-least-once delivery because the only way to avoid losing a job is to redeliver when you are unsure it finished. What you can achieve is <em>effectively</em>-once: make the handler idempotent so duplicates have no extra effect. Concretely, dedupe with an idempotency key and a unique constraint, check job status before acting, write outputs to deterministic keys, claim jobs with compare-and-set, and pass the job ID as an idempotency key to external APIs such as payment providers.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>A worker crashes in the middle of a job. What happens?</summary>
+    <div class="answer">
+      <p>The message was received but never acked, so after the visibility timeout expires it becomes visible again and another worker picks it up. The job row may still say <code>running</code>, so workers should claim with a lease (<code>locked_until</code>) and be allowed to take over an expired one. For long jobs the worker heartbeats to extend its lease, so a crash is detected within one heartbeat interval instead of waiting for a huge timeout. If the job supports checkpoints, the next worker resumes from the last one. After <code>maxReceiveCount</code> failed deliveries the message goes to the DLQ.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>One corrupted file keeps failing. How do you stop it from blocking everything?</summary>
+    <div class="answer">
+      <p>Cap the attempts and use a dead-letter queue. Classify errors: a corrupt file is non-retryable, so mark the job failed immediately and ack; unknown or crash-causing failures are caught by the broker's receive count and moved to the DLQ after a few tries. Retries use exponential backoff with jitter so a bad message does not spin hot. Alert on DLQ depth, keep the error context, fix the underlying bug and redrive. In an ordered or partitioned system, move the failing message aside to a retry topic so the rest of the partition keeps flowing.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Should the client poll, or should we use webhooks or WebSockets?</summary>
+    <div class="answer">
+      <p>Start with polling a <code>GET /jobs/{id}</code> endpoint: it is simple, stateless and robust, and a modest interval with backoff and a <code>Retry-After</code> hint keeps load low. Add push (WebSocket, SSE, mobile push) when users are watching and expect instant feedback, see <a href="06-real-time-updates.html">Real-Time Updates</a>. Use webhooks for server-to-server consumers, with signed payloads and retries on the sender side. Keep the status endpoint as the source of truth in every case, because notifications can be missed.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you scale the workers, and what do you scale on?</summary>
+    <div class="answer">
+      <p>Scale on unmet demand, not CPU: queue depth per worker, or better the age of the oldest message against your latency target. KEDA on Kubernetes or an Auto Scaling group driven by a backlog-per-instance metric handle this, and they can scale to zero when idle. Keep a separate pool per job type so GPU, memory-heavy and lightweight jobs are sized independently, cap the maximum so downstream databases and APIs are not overwhelmed, and rate-limit calls to third parties. If demand still exceeds the cap, bound the queue and shed or reject low-priority work instead of letting the backlog grow indefinitely.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Why not just use Kafka for this?</summary>
+    <div class="answer">
+      <p><em>Short version below; the full Kafka vs RabbitMQ comparison is in <a href="02-scaling-writes.html#messaging-models">Scaling Writes</a>.</em></p>
+      <p>Kafka is a log, not a task queue. Messages are not removed on consumption; consumers track offsets, and within a consumer group each partition is read by only one consumer, so parallelism is capped by partition count and one slow or poison message blocks everything behind it in that partition. There is no per-message ack, delay or built-in DLQ, so you build retry topics yourself. Kafka shines when you need very high throughput, ordering per key, or replay of history by many independent consumers. For classic "do this task once, retry on failure" work, SQS, RabbitMQ or a Redis-based job library is usually a better fit. In an interview, saying Kafka is acceptable if you explain how you handle retries, ordering and parallelism.</p>
+    </div>
+  </details>
+
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="02-scaling-writes.html">02 · Scaling Writes (queues absorbing spikes)</a></li>
+    <li><a href="04-large-blobs.html">04 · Handling Large Blobs (process after upload)</a></li>
+    <li><a href="06-real-time-updates.html">06 · Real-Time Updates (push job status)</a></li>
+    <li><a href="07-multi-step-processes.html">07 · Multi-Step Processes (workflow engines)</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>

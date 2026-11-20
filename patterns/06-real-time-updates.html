@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real-Time Updates — System Design Patterns</title>
+<meta name="description" content="How servers push updates to clients the moment they happen: polling, long polling, SSE, WebSockets, pub/sub fan-out, delivery guarantees, and consistent-hash routing for stateful workloads.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="06" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 06 of 08</span>
+  <h1>Real-Time Updates</h1>
+  <p class="lede">HTTP is built so the client asks and the server answers. Real-time features need the opposite: the server must tell the client something the moment it happens. You solve it in two halves: how the update travels over the last hop to the client, and how it gets from whoever produced it to the server holding that client's connection.</p>
+  <div class="meta">
+    <span class="chip">Polling</span>
+    <span class="chip">SSE</span>
+    <span class="chip">WebSockets</span>
+    <span class="chip">Pub/sub</span>
+    <span class="chip">Consistent hashing</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p>There are two separate problems, and interviewers like candidates who split them cleanly:</p>
+  <ol>
+    <li><strong>Client-facing: how does the update reach the client?</strong> Climb this ladder only as far as you must: <strong>short polling</strong> (client asks every few seconds), <strong>long polling</strong> (server holds the request open until there is news), <strong>Server-Sent Events</strong> (one-way push over a long-lived HTTP response), <strong>WebSockets</strong> (a full-duplex connection).</li>
+    <li><strong>Server-side: how does the update reach the <em>right</em> server?</strong> The server where the event happens is usually not the server holding the user's connection. Decouple them with <strong>pub/sub</strong>: whoever has the update publishes it, and whoever holds the connection subscribes.</li>
+    <li><strong>Special case: heavy per-document state.</strong> For collaborative editing, game rooms and similar workloads, route every participant of one document to the <em>same</em> stateful server using a <strong>consistent hash ring</strong>, so state lives in one memory and updates apply in order.</li>
+  </ol>
+  <p>Start with polling. It is boring, stateless, works through every proxy, and is often good enough. Reach for SSE or WebSockets only when latency or request volume proves polling is not enough, because persistent connections turn a stateless web tier into a stateful one and that costs real operational effort.</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>The prompt says chat, notifications, live scores, live comments, a live dashboard, a ride's moving dot on a map, or "show progress as it happens".</li>
+      <li>Users must see changes made by other users (or by background jobs) without refreshing.</li>
+      <li>Collaborative editing or multiplayer state is mentioned (Google Docs, Figma, a game lobby).</li>
+      <li>The requirement says "within a second" or "near real time", or a job's progress bar must update (see <a href="05-long-running-tasks.html">Long-Running Tasks</a>).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>Plain HTTP is <strong>request/response</strong>: a client sends a request, the server answers, the exchange is over. The server has no way to start a conversation. Yet many features need exactly that. A chat message arrives for Alice while she is looking at the screen. A video finishes transcoding and the progress bar should hit 100%. A goal is scored and a million viewers should see it within a second or two.</p>
+  <p>This breaks into two distinct difficulties:</p>
+  <h4>Difficulty 1: the last hop to the client</h4>
+  <p>The server cannot call the browser. The browser must keep some channel open, or keep asking. Each way of doing that has a different cost in latency, wasted requests, server memory, and compatibility with proxies and load balancers.</p>
+  <h4>Difficulty 2: finding the right server</h4>
+  <p>Once clients hold long-lived connections, each connection is pinned to <em>one</em> server in your fleet. Say Alice is connected to server 17 and Bob sends her a message through server 4. Server 4 has no connection to Alice. Somehow the message must travel from the server that learned about the event to the server that owns Alice's socket. With a hundred gateway servers and millions of users, "who holds Alice?" is a real routing problem.</p>
+
+  <div class="callout interview">
+    <span class="callout-title">Do the math out loud</span>
+    <p>Suppose 10M users are online at peak and each holds one connection. If one tuned gateway server can hold on the order of 50K to 100K mostly idle connections (the real number depends on memory per connection, kernel tuning and traffic, so hedge it), you need roughly 100 to 200 gateway servers for connections alone. Add a message rate: 10M users averaging one inbound message per minute is about 170K messages per second to route to the right gateway. That is why holding connections and routing messages are designed as two separate layers.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>This pattern appears whenever freshness is a product feature rather than a nicety. Typical prompts:</p>
+  <ul>
+    <li><strong>Chat (WhatsApp, Slack, Messenger):</strong> deliver messages, typing indicators and read receipts instantly, including to users on many devices.</li>
+    <li><strong>Notifications and live feeds:</strong> a badge count that ticks up, a new post appearing at the top of a timeline.</li>
+    <li><strong>Live comments and reactions on a stream:</strong> huge fan-out to a few popular channels.</li>
+    <li><strong>Live scores, stock tickers, auctions, ride tracking:</strong> many readers of the same fast-changing value.</li>
+    <li><strong>Collaborative editing (Google Docs, Figma, Notion):</strong> every keystroke goes to every collaborator, in order, merged correctly.</li>
+    <li><strong>Job progress:</strong> the transcoding or export progress bar from a <a href="05-long-running-tasks.html">long-running task</a>.</li>
+    <li><strong>Multiplayer games and shared whiteboards:</strong> per-room state with strict ordering.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>Steps 1 to 4 answer difficulty 1 (the last hop to the client). Steps 5 and 6 answer difficulty 2 (getting updates to the right server). Always start with the simplest step that meets the latency requirement.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Reach for it when…</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Short polling</td><td>Updates every few seconds are fine; few users or low frequency</td><td>Wasted requests, latency up to the poll interval</td></tr>
+        <tr><td>2</td><td>Long polling</td><td>You need near-instant updates but must stay on plain HTTP</td><td>A held request per client, re-request after every event</td></tr>
+        <tr><td>3</td><td>Server-Sent Events (SSE)</td><td>Server-to-client push only: feeds, scores, progress</td><td>One-way only; stateful connections</td></tr>
+        <tr><td>4</td><td>WebSockets</td><td>True two-way, low-latency traffic: chat, games, collaboration</td><td>Stateful servers, custom reconnect and LB work</td></tr>
+        <tr><td>5</td><td>Pub/sub between servers</td><td>Event producer and connection holder are different servers</td><td>Extra infrastructure, delivery-guarantee decisions</td></tr>
+        <tr><td>6</td><td>Consistent hash ring routing</td><td>Each update needs heavy, ordered, in-memory processing per document or room</td><td>Rebalancing, fencing, hot documents</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="step">Step 1</span>Short polling</h3>
+  <p>The client asks on a timer: <code>GET /notifications?since=1042</code> every 3 to 10 seconds. The server answers immediately with whatever is new, usually an empty list. There is no special infrastructure. Every request is an ordinary, stateless HTTP call that any load balancer, CDN, proxy, firewall and framework already handles, and any server in the fleet can answer it.</p>
+  <ul>
+    <li><strong>Latency:</strong> on average half the poll interval, at worst the whole interval. A 5-second poll means updates show up 0 to 5 seconds late.</li>
+    <li><strong>Waste:</strong> most responses are empty. 1M users polling every 5 seconds is <strong>200K requests per second</strong> of mostly nothing, each paying for TLS, headers and an auth check.</li>
+    <li><strong>Cheap tricks:</strong> use a cursor (<code>since</code> id, or ETag so unchanged answers are tiny 304s), slow down when the tab is hidden, add jitter so clients don't poll in lockstep, and serve the poll from a cache or a fast key lookup so empty polls cost almost nothing.</li>
+  </ul>
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Trivial to build, test and debug</li>
+      <li>Stateless: scales like any read endpoint, can be cached</li>
+      <li>Works everywhere; no reconnection logic, no sticky routing</li>
+      <li>Survives deploys and server failures for free</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Latency floor equal to the interval</li>
+      <li>Most requests return nothing</li>
+      <li>Load grows with users times poll rate, not with events</li>
+      <li>Poor fit for sub-second or chatty features</li>
+    </ul></div>
+  </div>
+  <p>Polling is also the right answer for many job progress bars: the client polls <code>GET /jobs/123</code> every couple of seconds, and nothing else is needed.</p>
+
+  <h3><span class="step">Step 2</span>Long polling</h3>
+  <p>Long polling keeps the HTTP request model but removes the empty answers. The client sends a request; if there is nothing new, the server <strong>does not answer yet</strong>. It parks the request until an event arrives or a timeout (typically 20 to 60 seconds) expires, then responds. The client processes the response and <em>immediately</em> sends the next request.</p>
+  <ol>
+    <li>Client: <code>GET /events?cursor=88</code>.</li>
+    <li>Server finds nothing newer than 88 and holds the connection open, registering the waiting request.</li>
+    <li>An event (id 89) occurs. The server completes the held request with it. Or the timeout fires and the server returns an empty 200/204.</li>
+    <li>Client handles the data, then repeats from step 1 with <code>cursor=89</code>.</li>
+  </ol>
+  <p>Latency becomes close to one network trip, because the server already has a request waiting. The <strong>cursor</strong> is what makes it safe: events that occur in the gap between one response and the next request are not lost, because the next request asks for "everything after 89".</p>
+  <ul>
+    <li><strong>Cost:</strong> the server now holds a pending request per client (memory, a file descriptor, a thread or async task). Under a thread-per-request server this is ruinous; an async server (Node, Netty, Go) copes well.</li>
+    <li><strong>Overhead after each event:</strong> a new HTTP request with full headers each time, so a busy stream is chattier than SSE or WebSockets.</li>
+    <li><strong>Compatibility:</strong> excellent. It is plain HTTP, but intermediaries may close idle connections, so keep the hold timeout shorter than the shortest proxy idle timeout in the path.</li>
+    <li><strong>History:</strong> this is how many chat systems worked before WebSockets. It is a legitimate fallback, and libraries such as Socket.IO still downgrade to it when needed.</li>
+  </ul>
+
+  <h3><span class="step">Step 3</span>Server-Sent Events (SSE)</h3>
+  <p>SSE is a standard way to keep <em>one</em> HTTP response open and stream events down it. The client creates <code>new EventSource('/stream')</code>. The server replies with <code>Content-Type: text/event-stream</code> and never ends the response, writing small text blocks whenever it has news:</p>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+
+id: 89
+event: score
+data: {"home":2,"away":1}
+
+id: 90
+data: {"minute":67}
+
+: heartbeat comment (keeps proxies from closing the idle stream)
+</code></pre>
+  <p>Events are separated by a blank line. The fields are <code>data</code> (payload, can span lines), <code>event</code> (a named type the client can listen for), <code>id</code>, and <code>retry</code> (how long the browser waits before reconnecting).</p>
+  <h4>Why SSE is nicer than it looks</h4>
+  <ul>
+    <li><strong>Automatic reconnection is built into the browser.</strong> If the connection drops, <code>EventSource</code> reconnects on its own and sends a <code>Last-Event-ID</code> header containing the last <code>id</code> it saw. The server can then replay everything after that id. You get resume-from-cursor semantics without writing client code.</li>
+    <li><strong>It is just HTTP.</strong> Normal auth, normal logging, and HTTP/2 multiplexing, which removes the old browser limit of about six connections per origin on HTTP/1.1. (The native <code>EventSource</code> cannot set custom headers; use cookies or a fetch-based client if you need a bearer token.)</li>
+    <li><strong>Simple server side:</strong> write text and flush. Proxies must not buffer the response (for example, disable response buffering in nginx for that route), and you should send a periodic comment line as a heartbeat.</li>
+  </ul>
+  <h4>Limits</h4>
+  <ul>
+    <li><strong>One direction only.</strong> The client talks back with ordinary HTTP requests (<code>POST /messages</code>). That is fine for feeds, scores, notifications and progress, and awkward for high-frequency client-to-server traffic.</li>
+    <li>Text only (binary must be encoded, for example as base64).</li>
+    <li>Still a long-lived stateful connection to one server, so everything in the scaling sections below applies.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-title">Underrated in interviews</span>
+    <p>If data flows only from server to client (live scores, a transcoding progress bar, notifications, a live comment feed), SSE is usually a better answer than WebSockets: simpler, plain HTTP, and free reconnection with <code>Last-Event-ID</code>. Saying "SSE is enough here, because the client never sends on this channel" shows judgment.</p>
+  </div>
+
+  <h3><span class="step">Step 4</span>WebSockets</h3>
+  <p>A WebSocket is a persistent, <strong>full-duplex</strong> TCP connection: either side can send a message at any time with very little per-message overhead. It starts as a normal HTTP request, then switches protocol.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 330" role="img" aria-label="WebSocket lifecycle: HTTP upgrade handshake, then bidirectional frames and ping pong heartbeats on one TCP connection">
+      <text class="t t-mid" x="140" y="24">Client</text>
+      <text class="t t-mid" x="560" y="24">Server</text>
+      <line class="l dash" x1="140" y1="36" x2="140" y2="316"/>
+      <line class="l dash" x1="560" y1="36" x2="560" y2="316"/>
+
+      <line class="l-a" x1="140" y1="62" x2="556" y2="62" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="350" y="54">GET /chat  Upgrade: websocket</text>
+      <line class="l-a" x1="556" y1="96" x2="144" y2="96" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="350" y="88">101 Switching Protocols</text>
+
+      <rect class="n-a" x="230" y="110" width="240" height="26" rx="6"/>
+      <text class="t-a t-mid" x="350" y="127">One long-lived TCP connection</text>
+
+      <line class="l-g" x1="140" y1="168" x2="556" y2="168" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="350" y="160">frame: client message</text>
+      <line class="l-g" x1="556" y1="198" x2="144" y2="198" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="350" y="190">frame: server push, any time</text>
+      <line class="l-g" x1="556" y1="228" x2="144" y2="228" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="350" y="220">frame: server push</text>
+
+      <line class="l dash" x1="556" y1="262" x2="144" y2="262" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="350" y="254">ping (heartbeat)</text>
+      <line class="l dash" x1="140" y1="292" x2="556" y2="292" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="350" y="284">pong (no pong in time: drop and reconnect)</text>
+    </svg>
+    <figcaption>WebSocket lifecycle: one HTTP request upgrades the connection, after which both sides exchange small frames freely.</figcaption>
+  </figure>
+
+  <h4>How it works</h4>
+  <ol>
+    <li><strong>Handshake.</strong> The client sends a normal HTTP/1.1 <code>GET</code> with <code>Upgrade: websocket</code>, <code>Connection: Upgrade</code> and a random <code>Sec-WebSocket-Key</code>. The server replies <code>101 Switching Protocols</code> with a hash derived from that key. Because it begins as HTTP, it uses ports 80/443 and can reuse your auth. Browsers cannot set arbitrary headers on the WebSocket constructor, so tokens usually travel in a cookie, a short-lived query-string ticket, or the first message.</li>
+    <li><strong>Frames.</strong> After the upgrade the connection is no longer HTTP. Data moves as small <em>frames</em> (text or binary) with a header of roughly 2 to 14 bytes, far less than an HTTP request's headers.</li>
+    <li><strong>Heartbeats.</strong> The protocol has <em>ping</em> and <em>pong</em> control frames. Idle TCP connections can die silently: NATs and load balancers drop idle flows, and a phone going through a tunnel never sends a FIN. So servers ping every 20 to 30 seconds (below the shortest idle timeout in the path) and close connections that do not answer. Applications often add their own heartbeat message too.</li>
+    <li><strong>Close.</strong> Either side sends a close frame with a status code, or the TCP connection simply dies.</li>
+  </ol>
+  <h4>What WebSockets do <em>not</em> give you</h4>
+  <p>Unlike SSE, there is no built-in reconnect, no event ids and no replay. You (or a library such as Socket.IO, or a managed service) must build reconnection, resume cursors, message acknowledgements, channel multiplexing, and a fallback for networks that block upgrades. This is the "more infrastructure to get right" cost.</p>
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>True bidirectional, very low latency</li>
+      <li>Tiny per-message overhead</li>
+      <li>Text and binary payloads</li>
+      <li>Fits chat, games, collaborative editing</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Stateful connection: harder deploys and scaling</li>
+      <li>Needs WebSocket-aware load balancers, proxies and timeouts</li>
+      <li>You build reconnect, resume and acks yourself</li>
+      <li>Auth, authorization and abuse control are on you, per connection</li>
+    </ul></div>
+  </div>
+
+  <h3>Comparing the four delivery mechanisms</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Short polling</th><th>Long polling</th><th>SSE</th><th>WebSocket</th></tr></thead>
+      <tbody>
+        <tr><td>Direction</td><td>Client pulls</td><td>Client pulls; server answers when ready</td><td>Server to client only</td><td>Both directions</td></tr>
+        <tr><td>Typical latency</td><td>Up to the poll interval</td><td>About one network trip</td><td>About one network trip</td><td>About one network trip</td></tr>
+        <tr><td>Overhead per update</td><td>Full HTTP request, often empty</td><td>Full HTTP request per event</td><td>A few bytes of text</td><td>2 to 14 byte frame header</td></tr>
+        <tr><td>Server state</td><td>None</td><td>One parked request per client</td><td>One open stream per client</td><td>One open socket per client</td></tr>
+        <tr><td>Proxy / LB friendliness</td><td>Perfect</td><td>Good; watch idle timeouts</td><td>Good; disable response buffering</td><td>Needs upgrade support and long idle timeouts</td></tr>
+        <tr><td>Reconnection</td><td>Not applicable</td><td>Client re-requests with a cursor</td><td>Built in, with <code>Last-Event-ID</code></td><td>You build it</td></tr>
+        <tr><td>Browser support</td><td>Universal</td><td>Universal</td><td>All modern browsers</td><td>All modern browsers</td></tr>
+        <tr><td>Pick it when</td><td>Seconds of delay are fine, or as the first version</td><td>Near-real-time on restrictive networks or legacy clients</td><td>One-way live data: feeds, scores, progress</td><td>Two-way, chatty, latency-critical: chat, games, editing</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Two other options deserve one line each: <strong>WebTransport</strong> (over HTTP/3 and QUIC, with multiple streams and unreliable datagrams and no head-of-line blocking; promising but still maturing) and <strong>HTTP/2 server push</strong> (designed for pre-sending assets, not application events, and effectively removed from browsers, so it is not an answer here).</p>
+
+  <div class="callout warn">
+    <span class="callout-title">When the user is not connected at all: mobile push</span>
+    <p>None of the above works when the app is closed or the phone is asleep, because the OS kills your connection. For that, hand the message to the platform push services: <strong>APNs</strong> (Apple) and <strong>FCM</strong> (Google, used for Android and web push). Your server sends a small payload to them, and the OS wakes the app or shows a notification. A typical design: if the user has an active connection to a gateway, push over it; otherwise fall back to APNs/FCM. Push is best-effort and size-limited, so treat it as a nudge to open the app and fetch the real data.</p>
+  </div>
+
+  <h3><span class="step">Step 5</span>Pub/sub: getting the update to the right server</h3>
+
+  <h4>First, why connections change your architecture</h4>
+  <p>A normal web request occupies a server for milliseconds. A WebSocket or SSE connection occupies it for hours. That has consequences:</p>
+  <ul>
+    <li><strong>Connections are long-lived and stateful.</strong> Each one holds a socket, buffers, TLS state and some application state (who the user is, which rooms they joined). A well-tuned async server (Netty, Go, Node, Erlang) can hold <em>tens to hundreds of thousands</em> of mostly idle connections; the real limit depends on memory per connection, message rate and kernel tuning, so measure rather than quote.</li>
+    <li><strong>Separate the connection tier from business logic.</strong> Run a dedicated <em>gateway</em> (connection server) tier that only terminates sockets, authenticates, and shuttles messages. Chat logic, storage and fan-out decisions live in ordinary stateless services behind it. Then you can deploy business logic freely without dropping millions of sockets, and scale the two tiers independently.</li>
+    <li><strong>Load balancing differs.</strong> The LB must support the upgrade: an L4 (TCP) balancer passes the stream through untouched, while an L7 (HTTP) balancer must understand <code>Upgrade</code> and keep the connection open. Raise idle timeouts well above your heartbeat interval (many LBs default to 60 seconds or less). Use "least connections" rather than round robin so new sockets go to the least loaded gateway. Sticky sessions are <em>not</em> required for connections themselves: a client connects once and stays on that server. They only matter if you rely on server-local state, which the pub/sub design avoids.</li>
+    <li><strong>Deploys are disruptive.</strong> Restarting a gateway drops every connection on it, and all of those clients reconnect at the same moment. Treat this as a first-class concern (see "Operating it" below).</li>
+  </ul>
+
+  <h4>The routing problem and the pub/sub answer</h4>
+  <p>With many gateways, the server that produces an event (the chat API that received Bob's message) is usually not the gateway that holds Alice's socket. Rather than have every service know the fleet topology, insert a <strong>publish/subscribe</strong> layer between them:</p>
+  <ol>
+    <li>When a client connects to a gateway, the gateway <strong>subscribes</strong> to the channels that client cares about: <code>user:alice</code>, <code>room:42</code>, <code>doc:abc</code>.</li>
+    <li>Whoever has an update <strong>publishes</strong> it to the channel: <code>PUBLISH user:alice {...}</code>. The publisher neither knows nor cares how many gateways exist or which one holds Alice.</li>
+    <li>The pub/sub system delivers the message to every gateway subscribed to that channel. Each gateway writes it to the matching local sockets.</li>
+    <li>When the last local client for a channel disconnects, the gateway unsubscribes.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 300" role="img" aria-label="Producers publish to a pub/sub layer; each gateway subscribes to channels for its connected users and pushes to its clients">
+      <rect class="n" x="10" y="75" width="130" height="50" rx="8"/><text class="t t-mid" x="75" y="105">Chat service</text>
+      <rect class="n" x="10" y="175" width="130" height="50" rx="8"/><text class="t t-mid" x="75" y="205">Job worker</text>
+
+      <rect class="n-a" x="200" y="30" width="150" height="240" rx="10"/>
+      <text class="t t-mid" x="275" y="136">Pub/sub</text>
+      <text class="t-s t-mid" x="275" y="156">channel per user</text>
+      <text class="t-s t-mid" x="275" y="173">or per room</text>
+
+      <rect class="n-g" x="430" y="30" width="140" height="50" rx="8"/>
+      <text class="t t-mid" x="500" y="50">Gateway 1</text><text class="t-s t-mid" x="500" y="68">holds Alice, Dan</text>
+      <rect class="n-g" x="430" y="125" width="140" height="50" rx="8"/>
+      <text class="t t-mid" x="500" y="145">Gateway 2</text><text class="t-s t-mid" x="500" y="163">holds Bob</text>
+      <rect class="n-g" x="430" y="220" width="140" height="50" rx="8"/>
+      <text class="t t-mid" x="500" y="240">Gateway 3</text><text class="t-s t-mid" x="500" y="258">holds Carol, Eve</text>
+
+      <rect class="n" x="650" y="30" width="120" height="50" rx="8"/><text class="t t-mid" x="710" y="60">Clients</text>
+      <rect class="n" x="650" y="125" width="120" height="50" rx="8"/><text class="t t-mid" x="710" y="155">Clients</text>
+      <rect class="n" x="650" y="220" width="120" height="50" rx="8"/><text class="t t-mid" x="710" y="250">Clients</text>
+
+      <line class="l-a" x1="140" y1="100" x2="198" y2="100" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="140" y1="200" x2="198" y2="200" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="169" y="92">publish</text>
+      <text class="t-a t-mid" x="169" y="192">publish</text>
+
+      <line class="l-g" x1="350" y1="55" x2="428" y2="55" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="350" y1="150" x2="428" y2="150" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="350" y1="245" x2="428" y2="245" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="389" y="47">deliver</text>
+
+      <line class="l" x1="570" y1="55" x2="648" y2="55" marker-end="url(#arrow)"/>
+      <line class="l" x1="570" y1="150" x2="648" y2="150" marker-end="url(#arrow)"/>
+      <line class="l" x1="570" y1="245" x2="648" y2="245" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="609" y="47">socket</text>
+
+      <text class="t-s" x="10" y="292">Each gateway subscribes to the channels of the users connected to it. Publishers never need to know which gateway holds whom.</text>
+    </svg>
+    <figcaption>Pub/sub decouples producers from connection holders. This is the shape behind WhatsApp-style chat, notifications and live progress.</figcaption>
+  </figure>
+
+  <h4>Choosing the pub/sub layer</h4>
+  <p>Pub/sub (every subscriber gets every message) is a different model from a work queue (each message goes to one worker). The two are compared, along with Kafka vs RabbitMQ, in <a href="02-scaling-writes.html#messaging-models">Scaling Writes</a>.</p>
+  <ul>
+    <li><strong>Redis Pub/Sub:</strong> extremely fast and simple, but <em>fire-and-forget</em>. If a subscriber is disconnected or slow when a message is published, the message is simply gone, and nothing is stored. Fine for ephemeral signals (typing indicators, presence, cursor positions) or when durability lives elsewhere.</li>
+    <li><strong>Redis Streams, Kafka, Kinesis, Google Pub/Sub, SNS+SQS:</strong> durable logs or queues. Messages are persisted and can be replayed from an offset, which supports catch-up after a reconnect. Kafka suits very high throughput, but one topic per user does not scale, so you partition by user or room id and have gateways filter. Per-subscriber queues (SQS-style) can give each gateway its own mailbox.</li>
+    <li><strong>NATS:</strong> lightweight, very fast subject-based messaging with cheap, dynamic subscriptions (JetStream adds persistence).</li>
+    <li><strong>Pick by need:</strong> ephemeral, low-latency fan-out favours Redis or NATS; "must not lose it" favours a durable log, usually together with a database as the source of truth.</li>
+  </ul>
+
+  <h4>Alternative: a connection registry</h4>
+  <p>Instead of publishing to a channel everyone can subscribe to, keep a <strong>registry</strong> mapping each user to the gateway holding their connection, for example in Redis: <code>SET conn:alice gateway-17 EX 60</code>, refreshed by heartbeats. To deliver, the sender looks up the user's gateway and sends the message directly to that one (RPC, or a per-gateway queue or channel).</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Pub/sub by user or room channel</th><th>Connection registry</th></tr></thead>
+      <tbody>
+        <tr><td>Routing</td><td>Broker routes; gateways subscribe on connect</td><td>Sender looks up the user's gateway, then sends directly</td></tr>
+        <tr><td>Extra hop</td><td>None for the sender; the broker fans out</td><td>One registry lookup per message (cacheable briefly)</td></tr>
+        <tr><td>Stale state</td><td>Subscriptions vanish when a gateway dies or unsubscribes</td><td>Registry entries can be stale; needs TTLs and heartbeats</td></tr>
+        <tr><td>Group fan-out</td><td>Natural: many gateways subscribe to <code>room:42</code></td><td>Sender must look up and message every member's gateway</td></tr>
+        <tr><td>Best for</td><td>Rooms, broadcasts, presence, most chat designs</td><td>Mostly 1:1 messages, or when you need precise "is this user online?" answers</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Many real systems use both: a registry answers "is Alice online, and where?" (also useful for deciding between WebSocket delivery and APNs/FCM push), while pub/sub carries room broadcasts.</p>
+
+  <h4>Per-user, per-room, and very large fan-out</h4>
+  <ul>
+    <li><strong>Per-user channels</strong> (<code>user:alice</code>) are ideal for notifications and 1:1 chat: a gateway subscribes once per connected user. Cost: millions of tiny subscriptions, so pick a broker that makes subscriptions cheap (Redis and NATS do).</li>
+    <li><strong>Per-room channels</strong> (<code>room:42</code>) suit group chat and shared documents. A gateway subscribes <em>once per room</em> no matter how many of its local clients are in it, then fans out locally over sockets. This is why the pub/sub fan-out costs scale with the number of gateways, not the number of users.</li>
+    <li><strong>Fan-out on write vs on read.</strong> For a small group, the sender (or a service) can publish a copy to each member's channel (fan-out on write): simple, low read cost. For a room with millions of members, copying a message per member is too expensive; publish once to the room channel and let each gateway fan out locally (fan-out at the edge, closer to "on read"). Celebrity feeds make the same trade as in a news-feed design: write fan-out for ordinary users, read-time or edge fan-out for huge audiences.</li>
+    <li><strong>Live-stream comment firehose.</strong> A stream with 1M viewers and thousands of comments per second cannot show every comment to every viewer. Sample or rate-limit what is delivered, batch many messages into one frame every 100 to 500 ms, drop low-value events under load, and send only the latest value for things like viewer counts ("last value wins"). Humans cannot read 5,000 comments per second anyway.</li>
+  </ul>
+
+  <h4>Delivery guarantees: what happens when something is missed</h4>
+  <p>Pub/sub gives you speed, not safety. A gateway can be restarting, a phone can be in a tunnel, a broker can drop a message. Decide explicitly what guarantee each feature needs:</p>
+  <ul>
+    <li><strong>At-most-once</strong> (fire and forget): Redis Pub/Sub, UDP-like semantics. Right for typing indicators, cursors, presence blips, where a lost message is replaced by the next one a moment later.</li>
+    <li><strong>At-least-once:</strong> store first, then deliver, retry until acknowledged. Messages may arrive twice, so the client must <strong>deduplicate</strong> by message id. This is the usual choice for chat and notifications.</li>
+    <li><strong>Exactly-once</strong> delivery is not realistic end to end; you get "at-least-once plus idempotent handling" and call it effectively-once.</li>
+  </ul>
+  <h4>The reliable pattern: durable store plus "last seen id" catch-up</h4>
+  <p>The robust design treats the real-time channel as a <em>hint</em> and the database as the truth:</p>
+  <ol>
+    <li>The producer first <strong>writes the message to a durable store</strong> (database or log) and gets a monotonically increasing <strong>sequence number or message id</strong> per conversation (a per-room counter, a Kafka offset, or a time-ordered id).</li>
+    <li>Then it <strong>publishes</strong> over pub/sub for instant delivery to connected clients.</li>
+    <li>The client keeps the <strong>last id it has seen</strong>. Each incoming message carries its id, so the client can detect a <strong>gap</strong> (it got 90 then 93).</li>
+    <li>On a gap, or after any reconnect, the client asks the durable store: "give me everything after 90" (this is exactly what SSE's <code>Last-Event-ID</code> does). Missed messages are filled in from the database, in order.</li>
+    <li>The client <strong>acks</strong> receipt (or simply advances its cursor). Unacked messages can be retried, or fall back to mobile push. The client <strong>drops duplicates</strong> it already has.</li>
+  </ol>
+  <p>This way a lost pub/sub message costs a slightly delayed delivery, never a lost message. <strong>Ordering</strong> is preserved per conversation if ids are assigned per conversation, and the client applies messages in id order (buffering out-of-order arrivals briefly). Global ordering across all conversations is almost never needed and is very expensive.</p>
+
+  <h4>Operating it: the failure modes that bite</h4>
+  <ul>
+    <li><strong>Presence and heartbeats.</strong> "Online" is inferred, not known. Clients or servers send heartbeats; the registry entry (<code>presence:alice</code>) carries a TTL refreshed on each one; no heartbeat means offline after the TTL. Debounce presence changes (a flapping mobile connection should not spam every friend), and broadcast presence lazily or only to users who are looking.</li>
+    <li><strong>Reconnection storms.</strong> When a gateway dies or is deployed, its 100K clients all reconnect within seconds, hammering the load balancer, auth service and database (a thundering herd). Clients must reconnect with <strong>exponential backoff plus random jitter</strong>, not a fixed retry delay. The server can also tell clients a randomised "come back in N seconds" when draining, and rate-limit connection accepts.</li>
+    <li><strong>Graceful deploys and draining.</strong> To roll a gateway: remove it from the load balancer so it takes no new connections, send clients a "reconnect elsewhere" message with a jittered delay, let the connections drain over minutes, then stop it. Roll one small batch at a time so the rest of the fleet absorbs the reconnects.</li>
+    <li><strong>Authentication and authorization on connect.</strong> Authenticate during the handshake (cookie, short-lived ticket token) and <em>authorize every subscription</em>: may this user join <code>room:42</code>? Re-check or expire the session on long-lived sockets, since a token that was valid at connect time may be revoked hours later. Validate message size and rate to resist abuse.</li>
+    <li><strong>Backpressure and slow consumers.</strong> A client on a bad network cannot drain its socket as fast as you publish. Without limits, per-connection buffers grow until the gateway runs out of memory. Give each connection a bounded outbound queue; when it fills, drop low-priority messages, collapse updates to the latest value, or disconnect the slow client and let it catch up via its last seen id on reconnect. Never let one slow client block the loop that serves the others.</li>
+    <li><strong>Hot channels.</strong> One popular room or celebrity channel puts load on one broker partition or Redis shard. Spread by sharding the channel (<code>room:42#0..N</code>), batching, or moving the hot channel to its own infrastructure.</li>
+  </ul>
+
+  <h3><span class="step">Step 6</span>Stateful routing with a consistent hash ring</h3>
+
+  <h4>Why pub/sub is the wrong tool here</h4>
+  <p>Pub/sub is perfect when an update is cheap to forward: a chat message is stored and relayed as is. But some workloads need the server to <em>process</em> every update against in-memory state before anyone else sees it:</p>
+  <ul>
+    <li><strong>Collaborative editing</strong> (Google Docs, Figma): two people type at the same spot at the same moment. Someone must merge those edits into one agreed document, in a single order.</li>
+    <li><strong>Multiplayer game rooms:</strong> one authoritative simulation per match decides who hit whom.</li>
+    <li><strong>Any per-document or per-room state held in memory</strong> for speed: a live auction, a shared whiteboard, a collaborative spreadsheet.</li>
+  </ul>
+  <p>If you spread such a document's users over many gateways and merge through pub/sub, every server would have to load the document, run the merge logic on every update, and agree on ordering, which needs distributed locks or consensus on the hot path. That is slow, wasteful (the same heavy work repeated N times) and fragile. The cleaner trick is to make the problem local: <strong>send every user of document D to the same server</strong>. That server keeps D in memory, applies updates one after another in the order it receives them (no locks, because there is a single writer), persists them, and broadcasts the results to the document's connected clients.</p>
+  <p>The question becomes: how do all clients of D reliably find "D's server", and what happens when servers come and go? A <strong>consistent hash ring</strong> answers both.</p>
+
+  <h4>How the ring routes documents</h4>
+  <p>This is a focused recap; the full treatment, including why naive <code>hash(key) % N</code> breaks, lives in <a href="02-scaling-writes.html">Scaling Writes</a>.</p>
+  <ol>
+    <li>Imagine a circle of hash positions (for example 0 to 2<sup>64</sup>-1 wrapping around). Hash each <strong>server</strong> (by its id or address) onto the ring.</li>
+    <li>Hash the <strong>documentId</strong> onto the same ring. The document is <strong>owned by the first server found moving clockwise</strong> from its position.</li>
+    <li>The router (or the gateway itself) holds the current list of servers, so it computes the owner <strong>locally</strong> with a binary search over sorted positions. There is no lookup service on the hot path: no extra hop, no central bottleneck.</li>
+    <li>The client connects (WebSocket) to its document's owner, or connects to any gateway that forwards to the owner. All clients of D hash to the same position and so land on the same server.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 348" role="img" aria-label="Clients connect through a router that hashes the document id onto a ring of stateful servers; each document is owned by the first server clockwise">
+      <rect class="n" x="10" y="48" width="110" height="44" rx="8"/><text class="t t-mid" x="65" y="75">Client A</text>
+      <rect class="n" x="10" y="138" width="110" height="44" rx="8"/><text class="t t-mid" x="65" y="165">Client B</text>
+      <rect class="n" x="10" y="228" width="110" height="44" rx="8"/><text class="t t-mid" x="65" y="255">Client C</text>
+
+      <line class="l" x1="120" y1="70" x2="188" y2="135" marker-end="url(#arrow)"/>
+      <line class="l" x1="120" y1="160" x2="188" y2="157" marker-end="url(#arrow)"/>
+      <line class="l" x1="120" y1="250" x2="188" y2="178" marker-end="url(#arrow)"/>
+
+      <rect class="n-a" x="190" y="120" width="140" height="70" rx="8"/>
+      <text class="t t-mid" x="260" y="145">Router / gateway</text>
+      <text class="t-s t-mid" x="260" y="162">knows the ring</text>
+      <text class="t-s t-mid" x="260" y="178">(no lookup hop)</text>
+
+      <line class="l-a" x1="330" y1="158" x2="468" y2="178" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="398" y="146">owner(docId)</text>
+
+      <circle class="l dash" cx="590" cy="180" r="120"/>
+      <text class="t-s t-mid" x="590" y="176">hash ring</text>
+      <text class="t-s t-mid" x="590" y="192">owner = next server clockwise</text>
+
+      <rect class="n-g" x="550" y="43" width="80" height="34" rx="8"/><text class="t t-mid" x="590" y="65">Server 1</text>
+      <rect class="n-g" x="654" y="223" width="80" height="34" rx="8"/><text class="t t-mid" x="694" y="245">Server 2</text>
+      <rect class="n-g" x="446" y="223" width="80" height="34" rx="8"/><text class="t t-mid" x="486" y="245">Server 3</text>
+
+      <circle class="n-w" cx="486" cy="120" r="7"/>
+      <text class="t-s t-mid" x="430" y="124">doc A → S1</text>
+      <circle class="n-w" cx="694" cy="120" r="7"/>
+      <text class="t-s t-mid" x="722" y="104">doc B → S2</text>
+      <circle class="n-w" cx="590" cy="300" r="7"/>
+      <text class="t-s t-mid" x="590" y="324">doc C → S3</text>
+
+      <text class="t-s" x="10" y="340">Each server keeps its documents in memory and applies updates in order. Adding or removing a server moves only the documents on one arc.</text>
+    </svg>
+    <figcaption>Documents are hashed onto the same ring as servers. Every participant of one document is routed to its single owner.</figcaption>
+  </figure>
+
+  <h4>When servers join or leave</h4>
+  <ul>
+    <li><strong>Add a server:</strong> it lands at a new position and takes over only the arc between itself and the previous server. Documents on that arc change owner; every other document stays put. (With modulo hashing nearly <em>everything</em> would move.)</li>
+    <li><strong>Remove or lose a server:</strong> its arc falls to the next server clockwise. Clients of the affected documents see their connection drop, reconnect (with jittered backoff), get routed to the new owner, and that owner <strong>loads the document's state</strong> from the database or operation log and rebuilds memory. In-memory state is a cache of durable state, so the server must persist updates (or at least a write-ahead log) as it goes.</li>
+    <li><strong>Virtual nodes:</strong> a few servers placed once each leave uneven arcs, so one server may own twice the load of another. Place each physical server at many positions (for example 100 to 256 virtual nodes). Arcs even out, and when a server dies its load is spread across all the others rather than dumped on a single neighbour.</li>
+  </ul>
+
+  <h4>What to watch for</h4>
+  <ul>
+    <li><strong>Membership must be agreed.</strong> Router and servers need a consistent view of who is alive. Use a coordination service (ZooKeeper, etcd, Consul) or gossip (as in Cassandra and many actor systems). Views will briefly disagree.</li>
+    <li><strong>Dual ownership during rebalancing.</strong> For a moment, the old owner may still think it owns document D while the new owner has taken over (a stale view, a network partition, a long GC pause). Two writers corrupt the document. Protect with an <strong>epoch (fencing token)</strong>: each ownership change increments a number, every write to the store carries it, and the store rejects writes with an older epoch. Alternatively take a short lease in etcd or ZooKeeper before accepting writes for D.</li>
+    <li><strong>Hot documents.</strong> Hashing balances <em>documents</em>, not <em>load</em>. One viral document with 50,000 live viewers still sits on one server. Cap collaborators per document, send the huge read-only audience through the pub/sub fan-out path (editors on the owner, viewers on ordinary gateways), and watch for it in metrics.</li>
+    <li><strong>Memory and eviction.</strong> Unload idle documents after a timeout, and snapshot state periodically so loading does not mean replaying a long history.</li>
+    <li><strong>Gateway tier and ring tier can be the same or separate.</strong> Simplest: clients connect through a stateless gateway that hashes the documentId and proxies the socket to the owner. Separate tiers keep deploys of editing servers from dropping every client connection directly.</li>
+  </ul>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Single writer per document: ordered updates with no distributed locks</li>
+      <li>State lives in memory: very low latency</li>
+      <li>Routing is computed locally, with no lookup service</li>
+      <li>Scaling out moves only a small fraction of documents</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Stateful servers: deploys, failover and rebalancing need care</li>
+      <li>Needs membership, fencing and state reload on handoff</li>
+      <li>Load balances by document count, not real load; hot documents hurt</li>
+      <li>More moving parts than plain pub/sub</li>
+    </ul></div>
+  </div>
+
+  <h4>Tiny primer: how collaborative editing merges changes</h4>
+  <p><strong>Operational Transformation (OT)</strong>, used by Google Docs, has a central server order the operations; when two concurrent operations conflict (both insert at position 5), the server transforms one against the other so that applying them in either order gives the same text. It needs that single authoritative server, which is exactly why a hash ring that pins each document to one owner fits it so well. <strong>CRDTs</strong> (Yjs, Automerge) design the data structure so that concurrent edits commute and merge automatically in any order, so they tolerate peer-to-peer and offline editing and do not strictly need one owner; but they still benefit from a server that persists, relays and compacts the document. Either way, one owner per document makes the system simpler.</p>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>Real-time features are easy to demo and hard to run. These are the characteristic failure points, and the fix for each.</p>
+
+  <h3>Statefulness vs simplicity</h3>
+  <p>Every persistent connection ties a client to one server. You gain latency and lose easy deploys, easy autoscaling and free failover. Polling gives the reverse. Choose the least stateful mechanism that meets the latency requirement.</p>
+
+  <h3>Push is a hint, the database is the truth</h3>
+  <p>Connections drop, messages get lost, clients sleep. Design so that missing a push never loses data: persist first, publish second, and let any client rebuild its state with "give me everything after id N" on connect and on suspected gaps.</p>
+
+  <h3>Reconnection storms</h3>
+  <p>A deploy, a crashed gateway or a network blip makes a whole tier of clients reconnect at once. Without jittered exponential backoff, drain-based rolling deploys and accept-rate limits, the reconnect wave itself takes down the auth service or database.</p>
+
+  <h3>Slow consumers and memory</h3>
+  <p>Unbounded outbound buffers turn one bad network into a gateway out-of-memory crash. Bound every queue, coalesce or drop low-value updates, and disconnect clients that cannot keep up.</p>
+
+  <h3>Fan-out cost</h3>
+  <p>The cost of one event is its audience size. Ordinary rooms can use per-member delivery; huge audiences need publish-once with edge fan-out, batching and sampling. Do not promise to deliver every event to every viewer of a mega-stream.</p>
+
+  <h3>At-most-once vs durable</h3>
+  <p>Redis Pub/Sub is fast but forgets. Using it alone for messages that must arrive loses them silently. Pair it with a durable store, or use a log-based broker, when loss matters.</p>
+
+  <h3>Stateful ring pitfalls</h3>
+  <p>Dual ownership during rebalancing (fix with epochs/fencing), hot documents (cap collaborators, offload readers to pub/sub), and slow state reloads after a failover (snapshots plus a log).</p>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>Options</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Client protocol libraries</td><td>Native WebSocket / EventSource, Socket.IO, SignalR, Phoenix Channels</td><td>Libraries add reconnect, rooms, acks and fallback to long polling. Native <code>EventSource</code> gives SSE reconnect for free.</td></tr>
+        <tr><td>Managed real-time services</td><td>AWS API Gateway WebSocket / AWS AppSync, Pusher, Ably, PubNub, Firebase Realtime Database</td><td>Outsource connection holding and fan-out. Trade control and per-message cost for speed of delivery.</td></tr>
+        <tr><td>Gateway servers</td><td>Node.js, Go, Java (Netty / Vert.x), Elixir/Erlang (Phoenix, ejabberd)</td><td>Event-driven runtimes hold very many connections per box. Erlang/Elixir are famous for this (WhatsApp ran on Erlang).</td></tr>
+        <tr><td>Load balancers / proxies</td><td>NGINX, HAProxy, Envoy, AWS ALB / NLB</td><td>Confirm WebSocket support and raise idle timeouts. NLB (L4) passes sockets through; ALB (L7) supports upgrade.</td></tr>
+        <tr><td>Ephemeral pub/sub</td><td>Redis Pub/Sub, NATS, Valkey</td><td>Very low latency, no replay. Good for presence, typing, cursors.</td></tr>
+        <tr><td>Durable messaging</td><td>Kafka, Redis Streams, Amazon SNS+SQS, Kinesis, Google Pub/Sub, NATS JetStream</td><td>Persisted, replayable, at-least-once. Use when messages must not be lost.</td></tr>
+        <tr><td>Connection / presence registry</td><td>Redis (keys with TTL), DynamoDB, etcd</td><td>Maps user to gateway; TTL refreshed by heartbeats.</td></tr>
+        <tr><td>Membership / coordination</td><td>ZooKeeper, etcd, Consul, gossip (memberlist, SWIM)</td><td>Source of the server list for the hash ring, and leases or epochs for fencing.</td></tr>
+        <tr><td>Collaborative editing</td><td>Yjs, Automerge (CRDT); ShareDB (OT)</td><td>Libraries handle merging; you still choose where documents live.</td></tr>
+        <tr><td>Offline push</td><td>APNs, FCM, web push</td><td>Best-effort delivery to closed apps; keep payloads tiny.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <ul>
+    <li><strong>Start with polling.</strong> If a few seconds of delay is acceptable, polling is the correct answer, not a stepping stone you apologise for. A job-progress bar polled every 2 seconds is a perfectly good design.</li>
+    <li><strong>Don't reach for WebSockets until polling genuinely stops being enough.</strong> "Real-time" in a requirements doc often means "a few seconds". Persistent connections cost you stateful servers, special load balancer settings, reconnect logic and harder deploys. Ask what latency the product truly needs and measure whether polling load is actually a problem.</li>
+    <li><strong>One-way data does not need WebSockets.</strong> Use SSE for feeds, scores and progress.</li>
+    <li><strong>Don't build the hash ring for cheap updates.</strong> If updates can be forwarded as is (chat, notifications), plain pub/sub is simpler. The ring is for heavy per-document processing with in-memory state.</li>
+    <li><strong>Rarely-changing data</strong> belongs in a cache or CDN (see <a href="01-scaling-reads.html">Scaling Reads</a>), not a live stream.</li>
+    <li><strong>Mobile apps in the background</strong> cannot hold your socket. Use APNs/FCM for those, not connection tricks.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"For delivery to the client I'd start with polling, since a few seconds of latency is acceptable for the progress bar and it keeps the web tier stateless. For chat I need push, so I'd use WebSockets: the client opens one connection to a gateway tier whose only job is holding sockets, authenticating and heartbeating. The catch is that the server that receives Bob's message isn't the one holding Alice's socket, so I'd put pub/sub between them: the chat service writes the message to the database with a per-conversation sequence number and publishes to Alice's channel, and whichever gateway holds her connection is subscribed and pushes it. Pub/sub can drop messages, so the client tracks the last id it saw and, after any gap or reconnect, fetches everything after it from the database, deduplicating by id. Clients reconnect with jittered backoff so a gateway deploy doesn't cause a stampede. For collaborative editing, where every update needs heavy in-memory merging, I'd instead route every user of a document to one server with a consistent hash ring over the documentId, so there is a single writer per document, with an epoch to fence off stale owners during rebalancing."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>Why not just use WebSockets for everything?</summary>
+    <div class="answer">
+      <p>Because each connection pins a client to a server, which makes the tier stateful: harder deploys (draining), harder load balancing, reconnect storms, and you must build resume and acks yourself. If updates are one-way, SSE gives you push with automatic reconnect over plain HTTP. If a few seconds is fine, polling needs none of it. WebSockets are right when the client sends frequent messages too and latency matters: chat, games, editing.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Alice is connected to gateway 17; Bob's message arrives at gateway 4. How does it reach her?</summary>
+    <div class="answer">
+      <p>Gateway 4 (or the chat service behind it) stores the message, then publishes to a channel for Alice (or the conversation). Gateway 17 subscribed to that channel when Alice connected, so the broker delivers it there and the gateway writes it to her socket. Alternatively, look up Alice in a connection registry (<code>conn:alice = gateway-17</code>) and send it to that gateway directly. If she is not connected, skip the socket and use APNs/FCM; she catches up from the database when she opens the app.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Redis Pub/Sub dropped a message while a gateway was restarting. How do you avoid losing it?</summary>
+    <div class="answer">
+      <p>Never rely on the pub/sub message as the record. Persist the message first with a monotonic per-conversation id, then publish. Clients remember the last id they saw; on reconnect (or when they see a gap in ids) they request everything after that id from the durable store. Duplicates are dropped by id. A durable broker (Kafka, Redis Streams) can also replay from an offset, but the "persist then notify, client catches up" structure is what gives the guarantee.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>A gateway holding 100K connections is deployed. What goes wrong and how do you prevent it?</summary>
+    <div class="answer">
+      <p>All 100K clients reconnect at once, hitting the load balancer, auth and database together, and may cascade into other gateways. Prevent it with draining (remove from LB, tell clients to reconnect after a random delay, drain slowly), rolling one small batch at a time, client exponential backoff with jitter, accept-rate limiting on gateways, and making the reconnect path cheap (cached auth, no heavy queries on connect).</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Why use a consistent hash ring for Google Docs instead of pub/sub?</summary>
+    <div class="answer">
+      <p>Each edit must be merged against the document's current state and ordered consistently. With pub/sub and arbitrary gateways, every server would repeat the merge, and you would need distributed coordination to agree on the order. Routing all collaborators of a document to one owner lets that server hold the document in memory and apply edits one at a time, a single writer with no locks. The ring decides the owner by hashing the documentId, computed locally by the router, and adding or removing servers only moves a small arc of documents. The costs are state reload on handoff, fencing against dual ownership, and hot documents.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>What happens to a document when its owner server crashes?</summary>
+    <div class="answer">
+      <p>Membership (ZooKeeper/etcd/gossip) detects the failure, the ring is updated, and the document's arc passes to the next server clockwise. Clients reconnect with backoff and are routed to the new owner, which loads the latest snapshot plus the operation log from durable storage and resumes. Edits that were only in the dead server's memory are lost unless they were persisted before being acknowledged, so write ahead to the log first. An epoch number on every write prevents the old owner, if it is only partitioned rather than dead, from writing stale data afterwards.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="02-scaling-writes.html">02 · Scaling Writes (consistent hashing deep dive)</a></li>
+    <li><a href="04-large-blobs.html">04 · Handling Large Blobs</a></li>
+    <li><a href="05-long-running-tasks.html">05 · Long-Running Tasks (job progress)</a></li>
+    <li><a href="07-multi-step-processes.html">07 · Multi-Step Processes</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>

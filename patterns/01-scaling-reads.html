@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scaling Reads — System Design Patterns</title>
+<meta name="description" content="What to do when read traffic outgrows your database: indexes, denormalization, read replicas, caches and CDNs, plus the trade-offs of each.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="01" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 01 of 08</span>
+  <h1>Scaling Reads</h1>
+  <p class="lede">Your database can only answer so many queries per second. When reads outgrow it, you climb a ladder of fixes, from cheap and local (indexes) to heavy and distributed (caches and CDNs), and you pay a consistency price at each rung.</p>
+  <div class="meta">
+    <span class="chip">Read-heavy apps</span>
+    <span class="chip">Caching</span>
+    <span class="chip">Replication</span>
+    <span class="chip">Eventual consistency</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p>Most consumer apps are read-heavy. Ratios of <strong>10:1 to 100:1</strong> reads to writes are common, so reads are usually the first thing to fall over. Scale them in this order, and stop as soon as the problem is solved:</p>
+  <ol>
+    <li><strong>Get more out of the database you already have</strong>: indexes, denormalization, materialized views.</li>
+    <li><strong>Add read replicas</strong>: copies of the database that serve reads while the primary handles writes.</li>
+    <li><strong>Add a cache</strong> (Redis, Memcached) in front of the database.</li>
+    <li><strong>Add a CDN</strong> for anything static or public.</li>
+  </ol>
+  <p>Every rung makes reads faster and cheaper, but also makes data <em>staler</em>. Replicas lag, caches go stale, and a single hot key can melt a cache node. Being able to name these trade-offs and the fix for each is what the interviewer is looking for.</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>The prompt describes a feed, a catalogue, a profile page or a search results page.</li>
+      <li>Someone says "millions of users, mostly browsing."</li>
+      <li>The read-to-write ratio is stated or obviously lopsided (viewing vs posting, watching vs uploading).</li>
+      <li>A single page load fans out into many queries (post, author, like count, comments…).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>Picture Instagram. You open the app and see a dozen or more photos. Each one needs its own metadata: the poster's profile, the like count, a few comments. Naively, that is several queries per photo, so one scroll can turn into <strong>hundreds of database queries</strong>. Meanwhile, you personally post about once a day.</p>
+  <p>Multiply by millions of users and the database spends nearly all its time answering reads. CPU saturates, connection pools run dry, query latency climbs and the whole app slows down, including the rare writes.</p>
+
+  <div class="callout interview">
+    <span class="callout-title">Do the math out loud</span>
+    <p>Interviewers like back-of-envelope numbers. For example: 100M daily users × ~10 feed loads/day × ~20 items each = 20B item reads/day, which is about 230K reads/second on average and several times that at peak. One well-tuned relational database is nowhere near that, so you must design for it.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>It appears in almost every consumer-facing design. Typical prompts:</p>
+  <ul>
+    <li><strong>Instagram / Twitter / Facebook news feed</strong>: reading dwarfs posting.</li>
+    <li><strong>YouTube / Netflix catalogue and watch pages</strong>: metadata is read constantly, rarely changed.</li>
+    <li><strong>Amazon / e-commerce product pages</strong>: huge browsing volume versus orders.</li>
+    <li><strong>URL shortener</strong>: write once, redirect millions of times.</li>
+    <li><strong>Wikipedia, news sites, blogs</strong>: public content that changes rarely.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>Always start with the cheapest fix that could work. Each step below adds operational complexity and a new way to serve stale data, so don't skip ahead.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 770 170" role="img" aria-label="Read path through CDN, app servers, cache, read replicas and the primary database">
+      <g>
+        <rect class="n" x="5" y="45" width="100" height="56" rx="8"/><text class="t t-mid" x="55" y="78">Client</text>
+        <rect class="n-a" x="140" y="45" width="100" height="56" rx="8"/><text class="t t-mid" x="190" y="78">CDN</text>
+        <rect class="n" x="275" y="45" width="100" height="56" rx="8"/><text class="t t-mid" x="325" y="78">App servers</text>
+        <rect class="n-a" x="410" y="45" width="100" height="56" rx="8"/><text class="t t-mid" x="460" y="78">Cache</text>
+        <rect class="n-a" x="545" y="45" width="100" height="56" rx="8"/><text class="t t-mid" x="595" y="78">Replicas</text>
+        <rect class="n-g" x="665" y="45" width="100" height="56" rx="8"/><text class="t t-mid" x="715" y="78">Primary DB</text>
+      </g>
+      <g>
+        <line class="l" x1="105" y1="73" x2="138" y2="73" marker-end="url(#arrow)"/>
+        <line class="l" x1="240" y1="73" x2="273" y2="73" marker-end="url(#arrow)"/>
+        <line class="l" x1="375" y1="73" x2="408" y2="73" marker-end="url(#arrow)"/>
+        <line class="l" x1="510" y1="73" x2="543" y2="73" marker-end="url(#arrow)"/>
+        <line class="l" x1="645" y1="73" x2="663" y2="73" marker-end="url(#arrow)"/>
+      </g>
+      <text class="t-s t-mid" x="190" y="120">static, public</text>
+      <text class="t-s t-mid" x="460" y="120">hot data, in memory</text>
+      <text class="t-s t-mid" x="595" y="120">copies of the DB</text>
+      <text class="t-s t-mid" x="325" y="120">stateless</text>
+      <text class="t-s t-mid" x="715" y="120">all writes</text>
+      <text class="t-s" x="5" y="152">Each layer absorbs traffic so the layer to its right sees far fewer requests. The primary only handles writes and the reads nothing else could answer.</text>
+    </svg>
+    <figcaption>The read path. A request stops at the first layer that can answer it.</figcaption>
+  </figure>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Reach for it when…</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>Indexes, denormalization, materialized views</td><td>Queries are slow or join-heavy</td><td>Slower writes, duplicated data</td></tr>
+        <tr><td>1</td><td>Read replicas</td><td>One machine can't serve the query volume</td><td>Replication lag</td></tr>
+        <tr><td>2</td><td>Cache (Redis / Memcached)</td><td>The same data is read again and again</td><td>Staleness, invalidation, hot keys</td></tr>
+        <tr><td>3</td><td>CDN</td><td>Content is static or public, users are global</td><td>Harder invalidation, only for shareable content</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="step">Step 0</span>Get the most out of your existing database</h3>
+  <p>Before adding any infrastructure, make sure the database is not doing needless work.</p>
+
+  <h4>Indexes</h4>
+  <p>An index (usually a B-tree) lets the database jump straight to matching rows instead of scanning the whole table, turning an O(n) scan into roughly O(log n). For the feed query "latest 20 posts by this user":</p>
+<pre><code>CREATE INDEX idx_posts_user_created
+  ON posts (user_id, created_at DESC);
+
+SELECT id, caption, created_at
+FROM posts
+WHERE user_id = 42
+ORDER BY created_at DESC
+LIMIT 20;</code></pre>
+  <ul>
+    <li><strong>Composite indexes</strong> follow the <em>leftmost-prefix rule</em>: an index on <code>(user_id, created_at)</code> serves queries filtering on <code>user_id</code>, or on both, but not on <code>created_at</code> alone. Column order matters.</li>
+    <li><strong>Covering indexes</strong> include every column the query needs, so the database can answer from the index alone (an "index-only scan") without touching the table.</li>
+    <li><strong>Trade-off:</strong> every index must be updated on every write and takes disk and memory. Index what you query, not everything.</li>
+    <li>Use <code>EXPLAIN ANALYZE</code> to confirm the planner actually uses your index.</li>
+  </ul>
+
+  <h4>Denormalization</h4>
+  <p>Normalized schemas need joins, and joins are expensive at scale. Denormalizing means deliberately storing redundant data so a read touches one row instead of many:</p>
+  <ul>
+    <li>Keep <code>like_count</code> and <code>comment_count</code> on the post row instead of running <code>COUNT(*)</code> over a likes table on every view.</li>
+    <li>Copy the author's name and avatar URL into the post (or into a feed table) so rendering a post needs no join to <code>users</code>.</li>
+    <li><strong>Trade-off:</strong> writes get more complex because you must update every copy, and copies can drift apart. Good for data that is read often and changes rarely.</li>
+  </ul>
+
+  <h4>Materialized views and precomputed tables</h4>
+  <p>A <em>materialized view</em> stores the result of an expensive query (a leaderboard, a "trending" list, per-user stats) as a real table that you refresh on a schedule or trigger. In PostgreSQL: <code>REFRESH MATERIALIZED VIEW CONCURRENTLY trending_posts;</code>. The same idea underlies feed tables that are precomputed per user ("fan-out on write").</p>
+
+  <h3><span class="step">Step 1</span>Read replicas</h3>
+  <p>When one machine still cannot keep up, copy the database. A <strong>read replica</strong> is a follower that receives a stream of every change from the <strong>primary</strong> (the write-ahead log in PostgreSQL, the binlog in MySQL) and applies it. Your application sends writes to the primary and spreads reads across the replicas. Read capacity then grows roughly linearly with replica count. Amazon Aurora, for example, supports up to 15 replicas per cluster.</p>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Simple, no application data-model changes</li>
+      <li>Linear read scaling</li>
+      <li>Doubles as high availability: a replica can be promoted if the primary dies</li>
+      <li>Can dedicate a replica to heavy analytics queries</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li><strong>Replication lag</strong>: replicas are slightly behind</li>
+      <li>Does <em>nothing</em> for write throughput, since every replica applies every write</li>
+      <li>Need read/write routing logic or a proxy</li>
+      <li>Each replica holds the full dataset (storage cost)</li>
+    </ul></div>
+  </div>
+
+  <h4>Sync vs async replication</h4>
+  <ul>
+    <li><strong>Asynchronous</strong> (the default for read scaling): the primary acknowledges the write immediately and ships it to replicas afterward. Fast, but replicas may be behind by milliseconds to seconds, and unreplicated writes can be lost if the primary crashes.</li>
+    <li><strong>Synchronous</strong>: the primary waits for at least one replica to confirm. No lost data and no lag on that replica, but writes are slower and a stuck replica can stall them. Often used as <em>semi-synchronous</em>: wait for one replica, not all.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 660 240" role="img" aria-label="Sequence diagram: a user writes a post to the primary, then immediately reads from a replica that has not received it yet">
+      <text class="t t-mid" x="90" y="24">Client</text>
+      <text class="t t-mid" x="330" y="24">Primary</text>
+      <text class="t t-mid" x="570" y="24">Replica</text>
+      <line class="l dash" x1="90" y1="36" x2="90" y2="226"/>
+      <line class="l dash" x1="330" y1="36" x2="330" y2="226"/>
+      <line class="l dash" x1="570" y1="36" x2="570" y2="226"/>
+
+      <line class="l-a" x1="90" y1="70" x2="326" y2="70" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="208" y="62">1. POST /posts</text>
+
+      <line class="l-a" x1="326" y1="96" x2="94" y2="96" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="208" y="114">2. 201 Created</text>
+
+      <line class="l dash" x1="330" y1="106" x2="566" y2="196" marker-end="url(#arrow)"/>
+      <text class="t-s" x="338" y="214">3. async replication (still in flight)</text>
+
+      <line class="l-b" x1="90" y1="146" x2="566" y2="146" marker-end="url(#arrow)"/>
+      <text class="t-b t-mid" x="208" y="139">4. GET /feed (arrives first)</text>
+      <rect class="n-b" x="452" y="98" width="196" height="26" rx="6"/>
+      <text class="t-b t-mid" x="550" y="115">Post missing: stale read</text>
+    </svg>
+    <figcaption>Read-your-writes violation: the replica answers before the change has arrived.</figcaption>
+  </figure>
+
+  <h4>Fixing "I posted, but I can't see my post"</h4>
+  <p>This is the canonical replica-lag bug, called a <em>read-your-writes</em> violation. Common fixes, from simplest to most precise:</p>
+  <ol>
+    <li><strong>Route the author's own reads to the primary</strong> for a short window (say 5–10 seconds) after they write, or for the specific object they just changed.</li>
+    <li><strong>Sticky sessions / session pinning</strong> to the primary after a write.</li>
+    <li><strong>Version tokens:</strong> on write, return the log position (PostgreSQL LSN, MySQL GTID) to the client; on read, only use a replica that has replayed at least that position, otherwise fall back to the primary.</li>
+    <li><strong>Optimistic UI:</strong> the client shows the new post locally right away, so the lag is invisible.</li>
+    <li><strong>Accept it</strong> for data where staleness is harmless (other people's like counts). Not everything needs strong consistency.</li>
+  </ol>
+
+  <h3><span class="step">Step 2</span>Add a cache</h3>
+  <p>If the same data is read again and again, serve it from memory instead of re-querying. An in-memory key-value store such as <strong>Redis</strong> or <strong>Memcached</strong> returns results in well under a millisecond and takes enormous load off the database. A relatively small <em>hot set</em> of data usually serves the vast majority of reads, so even a modest cache achieves a high hit rate.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 640 170" role="img" aria-label="Cache-aside pattern: the app checks the cache first and queries the database on a miss">
+      <rect class="n-a" x="20" y="45" width="120" height="60" rx="8"/><text class="t t-mid" x="80" y="80">Cache</text>
+      <rect class="n" x="260" y="45" width="120" height="60" rx="8"/><text class="t t-mid" x="320" y="80">App server</text>
+      <rect class="n-g" x="500" y="45" width="120" height="60" rx="8"/><text class="t t-mid" x="560" y="80">Database</text>
+      <line class="l-a" x1="258" y1="65" x2="142" y2="65" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="142" y1="90" x2="258" y2="90" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="200" y="55">① get(key)</text>
+      <text class="t-a t-mid" x="200" y="112">③ set(key, value, TTL)</text>
+      <line class="l-g" x1="382" y1="75" x2="498" y2="75" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="440" y="64">② on miss: query</text>
+      <text class="t-s" x="20" y="152">Hit at ①: return immediately. Miss: ② read the database, ③ populate the cache, return.</text>
+    </svg>
+    <figcaption>Cache-aside (lazy loading): the most common caching pattern.</figcaption>
+  </figure>
+
+  <h4>Caching strategies</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>How it works</th><th>Good for / watch out</th></tr></thead>
+      <tbody>
+        <tr><td>Cache-aside</td><td>App checks cache; on a miss it reads the DB and fills the cache.</td><td>Default choice. Only requested data is cached. First request is slow; cache can serve stale data.</td></tr>
+        <tr><td>Read-through</td><td>Same idea, but the cache layer itself loads from the DB on a miss.</td><td>Simpler app code. Needs a cache that supports loaders.</td></tr>
+        <tr><td>Write-through</td><td>Writes go to the cache and the DB synchronously.</td><td>Cache is always fresh for written keys. Writes are slower; caches data that may never be read.</td></tr>
+        <tr><td>Write-behind (write-back)</td><td>Writes hit the cache, which flushes to the DB asynchronously.</td><td>Very fast writes. Risk of data loss if the cache dies before flushing.</td></tr>
+        <tr><td>Write-around</td><td>Writes go straight to the DB, bypassing the cache.</td><td>Avoids filling the cache with rarely-read data. First read after a write is a miss.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Keeping the cache correct (invalidation)</h4>
+  <p>The cache is a copy, so it can disagree with the database. Your plan for that disagreement is the real design question:</p>
+  <ul>
+    <li><strong>TTL (time to live):</strong> every entry expires after N seconds, which bounds how stale it can be. Simple and robust; choose TTL by how wrong the data is allowed to be (seconds for like counts, hours for profile photos).</li>
+    <li><strong>Explicit invalidation:</strong> on write, <em>delete</em> the key (prefer delete over update, which avoids some race conditions) so the next read refills it.</li>
+    <li><strong>Event-driven invalidation:</strong> publish change events (for example via change-data-capture such as Debezium reading the database log) and have a consumer evict the affected keys.</li>
+    <li><strong>Versioned keys:</strong> include a version in the key (<code>post:123:v7</code>), so new versions never collide with old ones.</li>
+    <li><strong>Eviction policy</strong> (LRU, LFU) decides what gets thrown out when memory is full. It is separate from invalidation.</li>
+    <li><strong>Negative caching:</strong> briefly cache "not found" results too, so a flood of requests for a non-existent key cannot hammer the database ("cache penetration").</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-title">A subtle race in cache-aside</span>
+    <p>Reader A misses and reads the old value from the DB. Writer B updates the DB and deletes the cache key. Reader A then writes its stale value into the cache. The cache now holds old data until the TTL runs out. This is why a TTL is almost always kept as a safety net, even when you also invalidate explicitly.</p>
+  </div>
+
+  <h3><span class="step">Step 3</span>Add a CDN</h3>
+  <p>A <strong>content delivery network</strong> caches copies of content on servers close to users around the world (edge locations / points of presence). It is the right tool for anything static or shared between users: images, video segments, JavaScript and CSS bundles, public pages, and anonymous GET API responses. Users get lower latency, and your origin servers and databases never see most of the requests.</p>
+  <ul>
+    <li>Control behavior with HTTP headers: <code>Cache-Control: public, max-age=3600</code>, <code>s-maxage</code> for shared caches only, <code>stale-while-revalidate</code> to serve old content while refreshing in the background.</li>
+    <li>For assets that never change, use <strong>content-hashed file names</strong> (<code>app.3f9c2a.js</code>) with a very long max-age plus <code>immutable</code>. "Invalidation" becomes just deploying a new file name.</li>
+    <li>Explicit purges are possible (CloudFront invalidations, Cloudflare purge API) but are slow, rate-limited or costly at scale, so design around TTLs and versioned URLs where you can.</li>
+    <li>Not suitable for personalized or private data unless you carefully vary on the right keys or use signed URLs/cookies.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>This is where interviews are won. Each technique has a characteristic failure, and you should be ready to name it and its fix.</p>
+
+  <h3>Replica lag</h3>
+  <p>Covered above: users can fail to see their own writes. Mitigate with primary-routing windows, version tokens, or optimistic UI, and monitor replica lag so you can pull a lagging replica out of rotation.</p>
+
+  <h3>Stale caches</h3>
+  <p>Decide how much staleness each kind of data tolerates and pick TTLs to match. Combine TTL with explicit delete-on-write for data that must update quickly.</p>
+
+  <h3>Hot keys</h3>
+  <p>When millions of people request the same celebrity's post at once, one cache key on one cache node receives all of that traffic. Adding more cache nodes doesn't help, because the key still lives on exactly one of them and that node's CPU or network saturates. Options:</p>
+  <ul>
+    <li><strong>Local in-process cache</strong> with a very short TTL (1–5 seconds) on every app server. Most requests never leave the machine, and a few seconds of staleness is usually fine.</li>
+    <li><strong>Replicate the key</strong> under N names (<code>post:123#0</code> … <code>post:123#7</code>), spread across nodes, and have readers pick one at random.</li>
+    <li><strong>Serve it from the CDN</strong> if the content is public.</li>
+    <li><strong>Request coalescing ("single-flight")</strong>: when many requests need the same missing value, let one fetch it while the others wait for its result.</li>
+    <li><strong>Detect it:</strong> monitor per-key traffic (Redis can report hot keys when LFU eviction is enabled) so you can react before a node falls over.</li>
+  </ul>
+
+  <h3>Cache stampede (thundering herd)</h3>
+  <p>A very popular key expires, and thousands of concurrent requests all miss at once and rush to the database to rebuild it. The database can be overwhelmed by exactly the traffic the cache was supposed to absorb. Fixes:</p>
+  <ul>
+    <li><strong>Lock or single-flight on rebuild:</strong> only one request recomputes; the rest wait or serve the old value.</li>
+    <li><strong>Stale-while-revalidate:</strong> keep serving the expired value while one background refresh runs.</li>
+    <li><strong>TTL jitter:</strong> add a random amount to each TTL so many keys don't expire together.</li>
+    <li><strong>Probabilistic early refresh:</strong> each reader has a small, growing chance to refresh the key shortly <em>before</em> it expires.</li>
+    <li><strong>Pre-warm</strong> the cache for known-hot data, especially after a deploy or cache restart.</li>
+  </ul>
+
+  <h3>The cache is not your source of truth</h3>
+  <p>A cache node can die or be flushed. Your system must still work, just more slowly, with the database absorbing the load. Protect it with rate limiting, circuit breakers and gradual cache warm-up so a cold cache doesn't cause a cascading outage.</p>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>Options</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Relational DB + replicas</td><td>PostgreSQL, MySQL, Amazon Aurora / RDS, Cloud SQL</td><td>Managed services give you replica endpoints and automatic failover. Use a proxy (ProxySQL, pgpool-II, RDS Proxy) or app-level routing to split reads and writes.</td></tr>
+        <tr><td>Distributed cache</td><td>Redis, Memcached, Amazon ElastiCache, Valkey</td><td>Redis adds data structures, persistence, replication and clustering. Memcached is simpler and multi-threaded, with plain key-value only.</td></tr>
+        <tr><td>In-process cache</td><td>Caffeine (Java), Guava, <code>lru-cache</code> (Node), <code>cachetools</code> (Python)</td><td>Fastest possible, but each server has its own copy, so keep TTLs short.</td></tr>
+        <tr><td>CDN</td><td>CloudFront, Cloudflare, Fastly, Akamai</td><td>Edge caching, TLS termination, DDoS protection. Plan invalidation around TTLs and versioned URLs.</td></tr>
+        <tr><td>Precomputed views</td><td>Materialized views, Elasticsearch, DynamoDB/Cassandra read-optimized tables</td><td>Shape the data for the exact query so the read is a single key lookup.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <ul>
+    <li><strong>Don't cache before indexing.</strong> A missing index is the most common cause of a "slow database", and a cache just hides it. Check <code>EXPLAIN</code> first.</li>
+    <li><strong>Modest traffic.</strong> A single well-indexed relational database handles a lot of read traffic. If your numbers don't demand more, don't add replicas and caches "just in case".</li>
+    <li><strong>Data that must be strongly consistent</strong> (account balances, remaining inventory, seat availability at checkout) should be read from the primary, not from a cache or lagging replica.</li>
+    <li><strong>Low-reuse or highly personalized data.</strong> If each item is read once, a cache has nothing to hit.</li>
+    <li><strong>The real bottleneck is writes.</strong> Replicas and caches won't help. See <a href="02-scaling-writes.html">Scaling Writes</a>.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"This is read-heavy, probably 100 to 1 reads to writes, so reads are what will break first. I'll start by making sure the queries are indexed and denormalize the like and comment counts to avoid joins. If one database still can't handle it, I'll add read replicas and route the author's own reads to the primary so they always see their own posts. In front of that I'll put Redis with cache-aside and short TTLs, and a CDN for media. The risks I'd watch are replica lag, stale cache entries, and hot keys for celebrity content, which I'd handle with a short-lived in-process cache."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>A user posts, refreshes, and the post is missing. Why, and how do you fix it?</summary>
+    <div class="answer">
+      <p>The write went to the primary, but the refresh read from an asynchronous replica that hadn't received it yet. Fix it by routing that user's reads to the primary for a short window after a write (or by passing a log-position token and only using replicas that have caught up). Optimistic UI hides the lag on the client.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you invalidate a cache?</summary>
+    <div class="answer">
+      <p>Use layers. A TTL guarantees a bound on staleness, delete-on-write keeps hot data fresh, and change-data-capture events can evict keys when data changes through other paths (batch jobs, other services). Choose the TTL by how stale the business can tolerate. Keep the TTL even when you invalidate explicitly, because invalidation can fail or race.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Your Redis cluster restarts and the cache is empty. What happens?</summary>
+    <div class="answer">
+      <p>Every request misses and goes to the database at once, a cold-start stampede that can take the database down. Mitigate with request coalescing, rate limiting or load shedding in front of the DB, gradual traffic ramp-up, pre-warming known-hot keys, and Redis replication or persistence so a single node failure doesn't wipe the cache.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Read replica or cache: which first?</summary>
+    <div class="answer">
+      <p>Replicas are generic: they serve <em>any</em> query, including complex ones, with no application changes beyond routing, but scale reads only linearly with cost. Caches are far cheaper per read and faster, but only help for repeated, key-addressable reads, and add invalidation logic. Most systems end up with both. Start with whichever matches the access pattern: ad-hoc or varied queries lean toward replicas; repeated lookups of the same objects lean toward a cache.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you decide what to add next?</summary>
+    <div class="answer">
+      <p>Measure. Look at query latency (p50/p99), database CPU and connection saturation, the slowest queries, cache hit ratio, and replica lag. Fix the largest bottleneck with the cheapest tool, then re-measure. In an interview, state the metric that would tell you each step is needed.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="02-scaling-writes.html">02 · Scaling Writes</a></li>
+    <li><a href="04-large-blobs.html">04 · Handling Large Blobs (CDN downloads)</a></li>
+    <li><a href="06-real-time-updates.html">06 · Real-Time Updates</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>

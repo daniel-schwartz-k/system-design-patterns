@@ -1,0 +1,5 @@
+# Third-party source material, kept locally and not republished
+transcript-original--system-design.md
+
+# Local tooling output
+.playwright-mcp/

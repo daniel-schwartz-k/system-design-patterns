@@ -1,0 +1,892 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scaling Writes — System Design Patterns</title>
+<meta name="description" content="What to do when write traffic outgrows one database: vertical scaling, sharding and shard keys, consistent hashing, write-optimized storage, queues, load shedding and batching.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="02" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 02 of 08</span>
+  <h1>Scaling Writes</h1>
+  <p class="lede">Replicas copy data, so they cannot absorb more writes. When one database can't keep up, you split the data across machines (sharding), pick a storage engine built for writes, and smooth out bursts with queues, load shedding and batching.</p>
+  <div class="meta">
+    <span class="chip">Write-heavy apps</span>
+    <span class="chip">Sharding</span>
+    <span class="chip">Consistent hashing</span>
+    <span class="chip">Queues &amp; batching</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p>Reads can be cached and copied; <strong>writes cannot</strong>. Every write has to reach durable storage and be applied by every copy of that data. So the strategy changes: instead of copying the data, you <em>split</em> it, and instead of writing eagerly, you <em>buffer and combine</em>. In escalation order:</p>
+  <ol>
+    <li><strong>Scale the single node first</strong>: bigger machine, fewer indexes, batched inserts, tuned commit settings.</li>
+    <li><strong>Shard</strong>: partition the data across several databases by a <em>shard key</em>, so each machine takes only a slice of the writes. Choosing the shard key is the real design decision.</li>
+    <li><strong>Use a write-optimized store</strong> (LSM-tree databases such as Cassandra, ScyllaDB, DynamoDB, or an append-only log) when the workload is mostly inserts.</li>
+    <li><strong>Handle bursts</strong> with a queue to absorb the spike, <strong>load shedding</strong> to drop the least important writes, and <strong>batching</strong> to do far less work per write. A queue only buys time: if the spike never ends, it grows forever.</li>
+  </ol>
+  <p>Sharding has a famous sub-problem: how to map keys to machines so that adding or removing a machine does not reshuffle everything. That is <strong>consistent hashing</strong>, covered in depth below.</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>Every user action is a write: posts, likes, views, clicks, GPS pings, sensor readings, chat messages, log lines.</li>
+      <li>The prompt gives a write rate that is clearly beyond one machine (tens of thousands of writes per second and up), or a dataset too large for one disk.</li>
+      <li>There is a sudden surge: a Super Bowl ad, a flash sale, a product launch, a viral post.</li>
+      <li>Someone proposes "just add read replicas" and the bottleneck is actually writes.</li>
+      <li>Counters (likes, views, impressions) are updated by millions of users on a small number of popular items.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>Take a social app. Every post is a write. Every like is a write. Every view you count is a write. A single post that goes viral can collect millions of likes within minutes, and a modest feature like "view counts" turns every page load into an update.</p>
+  <p>One database server has a hard ceiling on write throughput. Every write must be appended to the write-ahead log (WAL) and flushed to disk for durability, applied to the table, and applied to <em>every index</em> on that table. Once the disk, the CPU, the lock manager, or the single-writer replication stream saturates, writes start queueing, latency climbs, connection pools fill, and the app falls over, including the reads.</p>
+  <p>The tempting fix from <a href="01-scaling-reads.html">Scaling Reads</a> does not work here. A replica is a follower that replays every change made on the primary. Adding replicas adds read capacity, but each one must still apply <strong>100% of the writes</strong>, so the write capacity of the system stays exactly that of one machine (and replication adds a little overhead on top).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 770 250" role="img" aria-label="Left: a primary and two replicas, every node applies all writes. Right: a router and three shards, each shard applies about one third of the writes">
+      <text class="t t-mid" x="185" y="18">Replicas: copy everything</text>
+      <line class="l-a" x1="185" y1="26" x2="185" y2="50" marker-end="url(#arrow)"/>
+      <text class="t-a" x="196" y="42">W writes/s</text>
+      <rect class="n-a" x="125" y="52" width="120" height="44" rx="8"/>
+      <text class="t t-mid" x="185" y="72">Primary</text>
+      <text class="t-s t-mid" x="185" y="88">applies W</text>
+      <line class="l" x1="165" y1="96" x2="110" y2="148" marker-end="url(#arrow)"/>
+      <line class="l" x1="205" y1="96" x2="260" y2="148" marker-end="url(#arrow)"/>
+      <rect class="n" x="35" y="150" width="120" height="48" rx="8"/>
+      <text class="t t-mid" x="95" y="171">Replica 1</text>
+      <text class="t-s t-mid" x="95" y="188">applies W</text>
+      <rect class="n" x="215" y="150" width="120" height="48" rx="8"/>
+      <text class="t t-mid" x="275" y="171">Replica 2</text>
+      <text class="t-s t-mid" x="275" y="188">applies W</text>
+      <text class="t-s t-mid" x="185" y="222">Every copy replays every write:</text>
+      <text class="t-s t-mid" x="185" y="238">write capacity stays at one machine.</text>
+
+      <line class="l dash" x1="385" y1="10" x2="385" y2="240"/>
+
+      <text class="t t-mid" x="575" y="18">Shards: split the data</text>
+      <line class="l-a" x1="575" y1="26" x2="575" y2="50" marker-end="url(#arrow)"/>
+      <text class="t-a" x="586" y="42">W writes/s</text>
+      <rect class="n-a" x="515" y="52" width="120" height="44" rx="8"/>
+      <text class="t t-mid" x="575" y="72">Router</text>
+      <text class="t-s t-mid" x="575" y="88">hash(key)</text>
+      <line class="l" x1="555" y1="96" x2="445" y2="148" marker-end="url(#arrow)"/>
+      <line class="l" x1="575" y1="96" x2="575" y2="148" marker-end="url(#arrow)"/>
+      <line class="l" x1="595" y1="96" x2="705" y2="148" marker-end="url(#arrow)"/>
+      <rect class="n-g" x="395" y="150" width="100" height="48" rx="8"/>
+      <text class="t t-mid" x="445" y="171">Shard 1</text>
+      <text class="t-s t-mid" x="445" y="188">applies ~W/3</text>
+      <rect class="n-g" x="525" y="150" width="100" height="48" rx="8"/>
+      <text class="t t-mid" x="575" y="171">Shard 2</text>
+      <text class="t-s t-mid" x="575" y="188">applies ~W/3</text>
+      <rect class="n-g" x="655" y="150" width="100" height="48" rx="8"/>
+      <text class="t t-mid" x="705" y="171">Shard 3</text>
+      <text class="t-s t-mid" x="705" y="188">applies ~W/3</text>
+      <text class="t-s t-mid" x="575" y="222">Each shard replays only its slice:</text>
+      <text class="t-s t-mid" x="575" y="238">write capacity grows with shard count.</text>
+    </svg>
+    <figcaption>Why replicas don't help writes, and why splitting does.</figcaption>
+  </figure>
+
+  <div class="callout interview">
+    <span class="callout-title">Do the math out loud</span>
+    <p>Example: 100M daily users, each generating about 20 write events a day (likes, views, posts) is 2B writes/day, roughly 23K writes/second on average, and perhaps 3 to 5 times that at peak, so 70K to 120K/s. A well-tuned single relational database can handle on the order of thousands to a few tens of thousands of simple writes per second (the exact figure depends heavily on hardware, row size, indexes and durability settings). So at this scale you must plan to split the writes. State the numbers, then state which pattern they trigger.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>Any design where data is created faster than it is consumed. Typical prompts:</p>
+  <ul>
+    <li><strong>Social feeds with likes, comments and views</strong> (Instagram, Twitter/X, TikTok): enormous counter updates.</li>
+    <li><strong>Ride-hailing and delivery</strong>: every driver sends a location ping every few seconds.</li>
+    <li><strong>Metrics, logging and analytics ingestion</strong>: millions of events per second, append-only.</li>
+    <li><strong>Chat and messaging</strong> (WhatsApp, Slack): each message is a write, plus delivery and read receipts.</li>
+    <li><strong>IoT and telemetry</strong>: huge numbers of devices reporting continuously.</li>
+    <li><strong>Ad click and impression tracking</strong>: bursty, high volume, and each event must be counted.</li>
+    <li><strong>Ticketing and flash sales</strong>: a short, violent spike (this also overlaps with <a href="03-contention.html">Contention</a>).</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>As with reads, start with the cheapest thing that could work. The steps below add progressively more operational complexity, and sharding in particular is hard to undo.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Reach for it when…</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>Vertical scaling and single-node tuning</td><td>You are not yet at the limits of one good machine</td><td>Hard ceiling, rising cost, single point of failure</td></tr>
+        <tr><td>1</td><td>Sharding (range, hash, directory)</td><td>Sustained write volume or data size exceeds one machine</td><td>Cross-shard queries and transactions, resharding, hot shards</td></tr>
+        <tr><td>2</td><td>Write-optimized storage (LSM trees, append-only logs)</td><td>Workload is mostly inserts and updates by key</td><td>Weaker query flexibility, compaction overhead, eventual consistency</td></tr>
+        <tr><td>3</td><td>Queues, load shedding, batching</td><td>Writes arrive in bursts, or many small writes hit the same rows</td><td>Delay, possible data loss, extra moving parts</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="step">Step 0</span>Scale up one node first</h3>
+  <p>Before you split anything, check how much one machine can really do. This is the answer interviewers want to hear first, because it shows judgment: sharding is expensive, so you earn it with numbers.</p>
+  <ul>
+    <li><strong>Bigger hardware:</strong> more cores, more RAM (so the working set and index pages stay in memory), NVMe SSDs with high write IOPS, and fast network. Modern cloud instances offer many terabytes of RAM and tens of thousands of IOPS.</li>
+    <li><strong>Make each write cheaper:</strong> drop indexes you don't need (each index is another structure to update on every write), use multi-row inserts or <code>COPY</code>/bulk loading, use a connection pooler, keep rows narrow, and avoid hot-row updates in transactions.</li>
+    <li><strong>Relax durability where the business allows:</strong> group commit and relaxed fsync settings (for example PostgreSQL <code>synchronous_commit = off</code>) trade a small window of possible loss for much higher throughput. Never do this for money.</li>
+    <li><strong>Partition tables within the node:</strong> time-based partitioning keeps recent data and its indexes small and makes old data cheap to drop.</li>
+    <li><strong>Separate the write path from everything else</strong> by moving analytics queries and reporting to a replica, so they stop competing with writes.</li>
+  </ul>
+  <p><strong>Where it ends:</strong> vertical scaling hits a ceiling (the biggest machine you can buy), cost grows faster than capacity, and one machine remains a single point of failure with one WAL and one set of disks. When your numbers say one node cannot do it, move on.</p>
+
+  <h3><span class="step">Step 1</span>Sharding: split the data</h3>
+  <p><strong>Sharding</strong> (horizontal partitioning) splits one logical dataset across several independent databases, called <em>shards</em>. Each shard owns a subset of the rows and handles only the writes for them. If you have 10 shards and the load is even, each takes about one tenth of the writes, so capacity grows roughly linearly as you add shards. As a bonus, each shard holds a fraction of the data, so storage and index sizes shrink too.</p>
+  <p>Each shard is itself usually replicated (a primary plus followers) for availability. Sharding scales writes; replication within each shard gives durability and read capacity. They are complementary.</p>
+  <p>Two decisions define a sharded system: <strong>what is the shard key</strong> (which field decides placement) and <strong>what is the strategy</strong> (how a key value maps to a shard).</p>
+
+  <h4>Sharding strategies</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>How it maps keys</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+      <tbody>
+        <tr><td>Range</td><td>Contiguous key ranges per shard (A-F, G-M, … or user IDs 0-1M, 1M-2M, …)</td><td>Efficient range scans and ordered queries; easy to split a range in two</td><td>Hot spots on sequential keys (timestamps, auto-increment IDs all hit the newest range); skewed data makes uneven shards</td></tr>
+        <tr><td>Hash</td><td>Hash the key, then map the hash to a shard (<code>hash(key) % N</code> or a ring)</td><td>Spreads load evenly even for sequential keys; no central lookup; stateless routing</td><td>Range queries become scatter-gather; naive modulo reshuffles everything when N changes (see consistent hashing below)</td></tr>
+        <tr><td>Directory (lookup)</td><td>A mapping service stores which shard owns each key or key range</td><td>Total flexibility: move individual tenants, isolate whales, rebalance without changing the hash function</td><td>The directory is an extra hop and a critical dependency; must itself be fast, cached and highly available</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <ul>
+    <li><strong>Range sharding</strong> is what Bigtable, HBase, Spanner and CockroachDB do under the hood: data is split into sorted ranges (tablets or regions) that automatically split when they grow or get hot. It shines when you query by key ranges (for example "all events for user X between two timestamps", when the key is <code>(user_id, timestamp)</code>).</li>
+    <li><strong>Hash sharding</strong> is the default answer for "spread this evenly" in interviews. Its limit is range queries on the hashed key.</li>
+    <li><strong>Directory sharding</strong> appears as MongoDB's config servers and chunk map, Vitess's topology, or a custom "tenant to shard" table in multi-tenant SaaS. A fixed number of hash slots (Redis Cluster) is a middle ground, covered below.</li>
+  </ul>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Write throughput and storage scale roughly linearly with shard count</li>
+      <li>Smaller shards are faster to back up, index and recover</li>
+      <li>Failures are contained: one shard down affects only its slice</li>
+      <li>Can place shards near their users (geo sharding)</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Queries that don't include the shard key must hit every shard</li>
+      <li>Multi-shard transactions and joins are slow or unsupported</li>
+      <li>Poor shard keys create hot shards</li>
+      <li>Resharding is operationally painful</li>
+      <li>More moving parts: routing, monitoring, schema migrations on N databases</li>
+    </ul></div>
+  </div>
+
+  <h3 id="consistent-hashing">Consistent hashing: why and how</h3>
+  <p>Hash sharding sounds trivial: <code>shard = hash(key) % N</code>. It breaks the moment <code>N</code> changes, and in a system that grows or loses machines, <code>N</code> always changes. Consistent hashing is the technique that fixes this, and it is one of the most commonly asked-about building blocks in distributed systems interviews.</p>
+
+  <h4>1. Why it exists: the problem with hash(key) % N</h4>
+  <p>Say you have 12 keys numbered 0 to 11 and use <code>key % N</code> as the shard. Compare the shard each key lands on with N = 3 shards and then with N = 4, after a fourth shard is added:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th></tr></thead>
+      <tbody>
+        <tr><td>Shard with N = 3</td><td>0</td><td>1</td><td>2</td><td>0</td><td>1</td><td>2</td><td>0</td><td>1</td><td>2</td><td>0</td><td>1</td><td>2</td></tr>
+        <tr><td>Shard with N = 4</td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td></tr>
+        <tr><td>Moved?</td><td>no</td><td>no</td><td>no</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Only keys 0, 1 and 2 stay put: <strong>9 of 12 keys (75%) move</strong>. In general, going from N to N+1 shards remaps about N/(N+1) of all keys, which approaches 100% as N grows. The ideal is much smaller: a new shard should take over only its fair share, <strong>about K/(N+1) of the K keys</strong> (here 3 of 12, the keys that land on the new shard 3, and nothing should move between the old shards).</p>
+  <p>The consequences of modulo hashing at scale are severe:</p>
+  <ul>
+    <li><strong>Massive data migration:</strong> three quarters of your data must be copied between machines just to add one node, while serving traffic.</li>
+    <li><strong>Cache-miss storms:</strong> if the shards are cache servers, nearly every lookup suddenly goes to the wrong node and misses, and the backing database takes the entire load at once.</li>
+    <li><strong>A failure looks the same as a resize:</strong> losing one node changes N, so a single machine crash remaps almost everything.</li>
+  </ul>
+  <p><strong>The goal of consistent hashing:</strong> when a node is added or removed, only about <code>K/N</code> keys (the keys that belong to that node) should move, and no key should move between two nodes that both survive.</p>
+
+  <h4>2. How it works</h4>
+  <ol>
+    <li><strong>Build the ring.</strong> Take the output space of a hash function, for example 0 to 2<sup>32</sup>-1 (or 2<sup>64</sup>-1), and imagine it bent into a circle, so the largest value wraps around to 0.</li>
+    <li><strong>Place nodes on the ring.</strong> Hash each node's identifier (name, IP) to get its position.</li>
+    <li><strong>Place keys on the ring.</strong> Hash each key with the same function to get its position.</li>
+    <li><strong>Lookup rule:</strong> a key is owned by the <strong>first node you meet moving clockwise</strong> from the key's position (wrapping past the top if necessary). Equivalently, each node owns the arc between its predecessor and itself.</li>
+  </ol>
+  <p>Finding the owner is a binary search over the sorted list of node positions, so a lookup is O(log N) and needs no central coordinator: every client or server with the same node list computes the same answer.</p>
+
+  <h5 style="margin:1.2em 0 .4em;font-size:.95rem">Worked example on a tiny ring (positions 0 to 99)</h5>
+  <p>Three nodes: <strong>A = 10</strong>, <strong>B = 40</strong>, <strong>C = 70</strong>. That gives these arcs: A owns 71 through 99 and 0 through 10 (the arc wraps around the top), B owns 11 through 40, C owns 41 through 70. Six keys hash to 5, 25, 33, 48, 62 and 85.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 410" role="img" aria-label="A hash ring from 0 to 100 with nodes A at 10, B at 40 and C at 70, and keys at 5, 25, 33, 48, 62 and 85. Green arrows run clockwise from each key to its owner node">
+      <circle class="l" cx="250" cy="215" r="150"/>
+      <line class="l" x1="250" y1="57" x2="250" y2="73"/>
+      <text class="t-s t-mid" x="250" y="51">0 / 100</text>
+      <path class="l-g" style="stroke-width:1.3" marker-end="url(#arrow)" d="M306.2 75.9 A150 150 0 0 1 322.3 83.6"/>
+      <path class="l-g" style="stroke-width:1.3" marker-end="url(#arrow)" d="M399.6 225.5 A150 150 0 0 1 352.7 324.3"/>
+      <path class="l-g" style="stroke-width:1.3" marker-end="url(#arrow)" d="M376.1 296.3 A150 150 0 0 1 352.7 324.3"/>
+      <path class="l-g" style="stroke-width:1.3" marker-end="url(#arrow)" d="M258.4 364.8 A150 150 0 0 1 114.3 278.9"/>
+      <path class="l-g" style="stroke-width:1.3" marker-end="url(#arrow)" d="M139.9 316.9 A150 150 0 0 1 114.3 278.9"/>
+      <path class="l-g" style="stroke-width:1.3" marker-end="url(#arrow)" d="M135.1 118.6 A150 150 0 0 1 322.3 83.6"/>
+      <circle class="n-w" cx="296.4" cy="72.3" r="6"/>
+      <text class="t-s t-mid" x="303.2" y="55.4">k=5</text>
+      <circle class="n-w" cx="400.0" cy="215.0" r="6"/>
+      <text class="t-s" x="422.0" y="219.0">k=25</text>
+      <circle class="n-w" cx="381.4" cy="287.3" r="6"/>
+      <text class="t-s" x="400.7" y="301.9">k=33</text>
+      <circle class="n-w" cx="268.8" cy="363.8" r="6"/>
+      <text class="t-s t-mid" x="271.6" y="389.6">k=48</text>
+      <circle class="n-w" cx="147.3" cy="324.3" r="6"/>
+      <text class="t-s" style="text-anchor:end" x="132.3" y="344.4">k=62</text>
+      <circle class="n-w" cx="128.6" cy="126.8" r="6"/>
+      <text class="t-s" style="text-anchor:end" x="110.8" y="117.9">k=85</text>
+      <circle class="n-a" cx="338.2" cy="93.6" r="16"/>
+      <text class="t t-mid" x="338.2" y="98.1">A</text>
+      <text class="t-a" x="360.5" y="66.9">A = 10</text>
+      <circle class="n-a" cx="338.2" cy="336.4" r="16"/>
+      <text class="t t-mid" x="338.2" y="340.9">B</text>
+      <text class="t-a" x="360.5" y="371.1">B = 40</text>
+      <circle class="n-a" cx="107.3" cy="261.4" r="16"/>
+      <text class="t t-mid" x="107.3" y="265.9">C</text>
+      <text class="t-a" style="text-anchor:end" x="71.2" y="277.1">C = 70</text>
+
+      <rect class="n" x="490" y="70" width="280" height="196" rx="8"/>
+      <text class="t" x="506" y="94">Rule: go clockwise to the first node</text>
+      <text class="t-s" x="506" y="122">key 5  : next node clockwise is 10, so A</text>
+      <text class="t-s" x="506" y="144">key 25 : next node is 40, so B</text>
+      <text class="t-s" x="506" y="166">key 33 : next node is 40, so B</text>
+      <text class="t-s" x="506" y="188">key 48 : next node is 70, so C</text>
+      <text class="t-s" x="506" y="210">key 62 : next node is 70, so C</text>
+      <text class="t-s" x="506" y="232">key 85 : wraps past 100/0, next is 10, so A</text>
+      <text class="t-s" x="506" y="254">Positions increase clockwise from the top.</text>
+    </svg>
+    <figcaption>Each key (yellow dot) is owned by the first node clockwise from it. Key 85 wraps around the top of the ring to A.</figcaption>
+  </figure>
+
+  <p><strong>Adding a node.</strong> Now add <strong>D = 55</strong>. D lands in the arc that C used to own entirely (41 to 70). Walking clockwise, D now catches every key between its predecessor B (40) and itself (55). The only key in 41 to 55 is key 48, so <strong>key 48 moves from C to D</strong>. Key 62 is past D, so it still belongs to C. Keys 5, 25, 33 and 85 are unaffected. Exactly one arc changed hands, and it came from exactly one neighbor (the clockwise successor, C).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 360" role="img" aria-label="Two rings side by side. Before: nodes A, B, C, with the arc 41 to 55 highlighted inside C's arc. After: node D at 55 now owns arc 41 to 55, and key 48 moves from C to D while every other key stays put">
+      <text class="t t-mid" x="190" y="28">Before: A, B, C</text>
+      <text class="t t-mid" x="580" y="28">After: D joins at 55</text>
+
+      <circle class="l" cx="190" cy="185" r="100"/>
+      <path class="l-a" style="stroke-width:7;opacity:.35" d="M248.8 265.9 A100 100 0 0 1 94.9 215.9"/>
+      <path class="l-b" style="stroke-width:7;opacity:.6" d="M248.8 265.9 A100 100 0 0 1 159.1 280.1"/>
+      <circle class="n-w" cx="220.9" cy="89.9" r="5.5"/>
+      <text class="t-s t-mid" x="227.1" y="74.9">k=5</text>
+      <circle class="n-w" cx="290.0" cy="185.0" r="5.5"/>
+      <text class="t-s" x="310.0" y="189.0">k=25</text>
+      <circle class="n-b" cx="202.5" cy="284.2" r="5.5"/>
+      <text class="t-s t-mid" x="205.0" y="308.1">k=48</text>
+      <circle class="n-w" cx="121.5" cy="257.9" r="5.5"/>
+      <text class="t-s" style="text-anchor:end" x="107.9" y="276.5">k=62</text>
+      <circle class="n-w" cx="109.1" cy="126.2" r="5.5"/>
+      <text class="t-s" style="text-anchor:end" x="92.9" y="118.5">k=85</text>
+      <circle class="n-a" cx="248.8" cy="104.1" r="13"/>
+      <text class="t t-mid" x="248.8" y="108.6">A</text>
+      <text class="t-a" x="268.8" y="80.6">A=10</text>
+      <circle class="n-a" cx="248.8" cy="265.9" r="13"/>
+      <text class="t t-mid" x="248.8" y="270.4">B</text>
+      <text class="t-a" x="268.8" y="297.4">B=40</text>
+      <circle class="n-a" cx="94.9" cy="215.9" r="13"/>
+      <text class="t t-mid" x="94.9" y="220.4">C</text>
+      <text class="t-a" style="text-anchor:end" x="62.6" y="230.4">C=70</text>
+      <text class="t-s t-mid" x="190" y="178">arc 41..55</text>
+      <text class="t-s t-mid" x="190" y="194">owned by C</text>
+
+      <circle class="l" cx="580" cy="185" r="100"/>
+      <path class="l-a" style="stroke-width:7;opacity:.35" d="M549.1 280.1 A100 100 0 0 1 484.9 215.9"/>
+      <path class="l-g" style="stroke-width:7;opacity:.6" d="M638.8 265.9 A100 100 0 0 1 549.1 280.1"/>
+      <circle class="n-w" cx="610.9" cy="89.9" r="5.5"/>
+      <text class="t-s t-mid" x="617.1" y="74.9">k=5</text>
+      <circle class="n-w" cx="680.0" cy="185.0" r="5.5"/>
+      <text class="t-s" x="700.0" y="189.0">k=25</text>
+      <circle class="n-b" cx="592.5" cy="284.2" r="5.5"/>
+      <text class="t-s t-mid" x="595.0" y="308.1">k=48</text>
+      <circle class="n-w" cx="511.5" cy="257.9" r="5.5"/>
+      <text class="t-s" style="text-anchor:end" x="497.9" y="276.5">k=62</text>
+      <circle class="n-w" cx="499.1" cy="126.2" r="5.5"/>
+      <text class="t-s" style="text-anchor:end" x="482.9" y="118.5">k=85</text>
+      <circle class="n-a" cx="638.8" cy="104.1" r="13"/>
+      <text class="t t-mid" x="638.8" y="108.6">A</text>
+      <text class="t-a" x="658.8" y="80.6">A=10</text>
+      <circle class="n-a" cx="638.8" cy="265.9" r="13"/>
+      <text class="t t-mid" x="638.8" y="270.4">B</text>
+      <text class="t-a" x="658.8" y="297.4">B=40</text>
+      <circle class="n-a" cx="484.9" cy="215.9" r="13"/>
+      <text class="t t-mid" x="484.9" y="220.4">C</text>
+      <text class="t-a" style="text-anchor:end" x="452.6" y="230.4">C=70</text>
+      <circle class="n-g" cx="549.1" cy="280.1" r="13"/>
+      <text class="t t-mid" x="549.1" y="284.6">D</text>
+      <text class="t-a t-mid" x="538.6" y="316.4">D=55</text>
+      <text class="t-s t-mid" x="580" y="178">arc 41..55</text>
+      <text class="t-s t-mid" x="580" y="194">now owned by D</text>
+
+      <text class="t-s" x="20" y="346">Only keys hashing into 41..55 change owner (k=48: C to D). A, B and the rest of C's keys do not move.</text>
+    </svg>
+    <figcaption>Adding node D moves exactly one arc, taken from its clockwise neighbor C. The red segment is the arc that changes hands.</figcaption>
+  </figure>
+
+  <p><strong>Removing a node.</strong> Go back to the original three-node ring and suppose B dies. B's arc (11 to 40) is absorbed by its clockwise successor C, so keys 25 and 33 now belong to C. Keys 5, 48, 62 and 85 do not move. Nothing is reshuffled between A and C. The mirror-image rule holds: when a node leaves, only that node's keys move, all to one neighbor.</p>
+  <p>Notice that D took 15 of the 100 positions rather than the ideal quarter, because the arcs were unequal to begin with. That is the weakness the next section fixes.</p>
+
+  <h4>3. Virtual nodes (vnodes)</h4>
+  <p>With only a few nodes on the ring, positions are essentially random, so arcs are very uneven: one node may own 45% of the ring and another 10%. That gives uneven load. Worse, when a node fails, <strong>its whole arc dumps onto a single clockwise neighbor</strong>, which may then be overloaded and fail too (a cascading failure).</p>
+  <p><strong>Solution:</strong> give each physical node many positions on the ring. Instead of hashing <code>"node-A"</code> once, hash <code>"node-A#0"</code>, <code>"node-A#1"</code>, … <code>"node-A#127"</code> and place all of them. Each of these is a <em>virtual node</em>. A physical node's data is the union of many small arcs scattered around the ring. Typical counts are in the range of 100 to 256 per node (Cassandra historically defaulted to 256 tokens per node, and newer versions default to fewer, with smarter token allocation).</p>
+  <ul>
+    <li><strong>Even load:</strong> by the law of large numbers, the sum of many random small arcs is close to 1/N of the ring. Imbalance shrinks roughly with the square root of the number of vnodes.</li>
+    <li><strong>Heterogeneous hardware:</strong> give a machine with twice the capacity twice as many vnodes and it takes twice the load.</li>
+    <li><strong>Failures and joins spread out:</strong> when a node dies, each of its many small arcs falls to a different successor, so the load is shared across many peers rather than one. When a node joins, it takes small slices from many existing nodes, so the data streams in from many sources in parallel and recovery is fast.</li>
+    <li><strong>Cost:</strong> more metadata (the ring has N times V entries), more complicated repair and streaming, and some operations (like range scans or repair) touch many small ranges.</li>
+  </ul>
+
+  <h4>4. Replication on the ring</h4>
+  <p>Consistent hashing also gives a natural way to replicate. To keep <code>R</code> copies of a key (commonly R = 3), store it on the key's owner <em>and the next R-1 distinct physical nodes clockwise</em>. This list is called the <strong>preference list</strong> in the Dynamo paper. With vnodes, consecutive ring positions can belong to the same machine, so the walk must <strong>skip vnodes that map to a physical node already in the list</strong> (and real systems also try to spread replicas across racks or availability zones). When a node is down, systems like Dynamo use <em>hinted handoff</em>: the next healthy node temporarily holds the write and hands it back when the original owner returns.</p>
+
+  <h4>Code: a ring lookup with vnodes</h4>
+<pre><code>import bisect, hashlib
+
+def h(s):                      # any uniform hash works (murmur3, xxhash)
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % 2**32
+
+class Ring:
+    def __init__(self, vnodes=128):
+        self.vnodes = vnodes
+        self.points = []       # sorted ring positions
+        self.owner = {}        # position -> physical node
+
+    def add(self, node):
+        for i in range(self.vnodes):
+            p = h(f"{node}#{i}")
+            bisect.insort(self.points, p)
+            self.owner[p] = node
+
+    def remove(self, node):
+        self.points = [p for p in self.points if self.owner[p] != node]
+        self.owner = {p: n for p, n in self.owner.items() if n != node}
+
+    def lookup(self, key):
+        # first ring position at or after hash(key), wrapping around
+        i = bisect.bisect_left(self.points, h(key)) % len(self.points)
+        return self.owner[self.points[i]]
+
+    def preference_list(self, key, r=3):
+        # next r DISTINCT physical nodes clockwise (skip repeat vnodes)
+        i = bisect.bisect_left(self.points, h(key))
+        nodes = []
+        for step in range(len(self.points)):
+            n = self.owner[self.points[(i + step) % len(self.points)]]
+            if n not in nodes:
+                nodes.append(n)
+                if len(nodes) == r:
+                    break
+        return nodes</code></pre>
+
+  <h4>5. Where it is used, and the alternatives</h4>
+  <ul>
+    <li><strong>Amazon Dynamo</strong> (the 2007 paper that popularized it), and its descendants <strong>Cassandra</strong>, <strong>Riak</strong> and ScyllaDB use a ring with vnodes and a preference list for replication. DynamoDB, the managed service, descends from these ideas but is a different system, so don't claim it exposes a ring.</li>
+    <li><strong>Distributed caches:</strong> the memcached client library "ketama" popularized consistent hashing so that adding a cache node doesn't invalidate the whole cache. Sharded Redis clients do similar things.</li>
+    <li><strong>Load balancers and CDNs:</strong> to send the same client or object to the same backend (cache affinity, session stickiness). Envoy offers a "ring hash" policy, and Google's <em>Maglev</em> uses a lookup-table variant with similar goals.</li>
+    <li><strong>Stateful service routing:</strong> chat or WebSocket servers, where one user or room must always land on the same server (see <a href="06-real-time-updates.html">Real-Time Updates</a>).</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Alternative</th><th>How it works</th><th>Prefer it when…</th></tr></thead>
+      <tbody>
+        <tr><td>Rendezvous (HRW) hashing</td><td>For a key, compute <code>hash(key, node)</code> for every node and pick the highest score. Removing a node moves only its keys.</td><td>You have a small, modest number of nodes (tens). It is simple, evenly balanced, needs no ring or vnodes, but costs O(N) per lookup.</td></tr>
+        <tr><td>Jump consistent hash</td><td>A tiny function (Google, 2014) mapping a key to a bucket number 0 to N-1 with no stored state and near-perfect balance.</td><td>Buckets are numbered and only grow or shrink at the end (sharded storage with sequential shard IDs). It can't remove an arbitrary node.</td></tr>
+        <tr><td>Fixed hash slots</td><td>Hash to one of a fixed number of slots (Redis Cluster: 16384), then assign slots to nodes; rebalancing moves whole slots.</td><td>You want simple, explicit, inspectable ownership and easy manual rebalancing, with a bounded amount of metadata to distribute.</td></tr>
+        <tr><td>Directory / lookup service</td><td>A service stores an explicit key (or range) to node mapping.</td><td>You need arbitrary placement: isolate big tenants, move single hot keys, or range sharding with automatic splits. Costs an extra hop and a critical dependency.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>6. Caveats</h4>
+  <ul>
+    <li><strong>It balances keys, not load.</strong> A celebrity key is still one key on one node, however nicely the ring is balanced. Hot keys need separate mitigation (see below).</li>
+    <li><strong>Membership must be shared.</strong> Every router needs the same view of the ring, or two clients will disagree about who owns a key. Spread it with a gossip protocol (Cassandra, Dynamo) or keep it in a coordination service such as ZooKeeper or etcd, or a central coordinator with clients caching and refreshing the map.</li>
+    <li><strong>The data still has to move.</strong> Consistent hashing tells you <em>which</em> keys move (a small fraction), not how to move them safely. The new node must stream its arc from the old owner (bootstrap), and reads and writes must be handled correctly during the handoff.</li>
+    <li><strong>It is about placement, not consistency.</strong> It says where a key lives. Whether replicas agree is a separate question, answered by quorums, leader election or consensus.</li>
+    <li><strong>Hash function quality matters.</strong> Use a uniform, fast, non-cryptographic hash (murmur3, xxhash), and the same one on every client.</li>
+  </ul>
+
+  <div class="callout interview">
+    <span class="callout-title">If asked: why consistent hashing?</span>
+    <blockquote>"With hash mod N, changing N remaps almost every key, so adding one shard triggers a huge data migration and, for caches, a miss storm. Consistent hashing places nodes and keys on the same hash ring, and each key belongs to the first node clockwise. Adding or removing a node then moves only about K over N keys, only to or from its neighbor. I'd use many virtual nodes per machine so load is even and a failed node's data spreads across many peers, and replicate each key to the next R distinct nodes. It solves placement, not hot keys or consistency, so I'd still handle those separately."</blockquote>
+  </div>
+
+  <h3>Choosing the shard key</h3>
+  <p>The shard key decides everything: how evenly load spreads, which queries are cheap, and which are painful. A good key satisfies four properties:</p>
+  <ul>
+    <li><strong>High cardinality:</strong> many distinct values, far more than the number of shards. Sharding on a boolean or a status column can use at most a couple of shards.</li>
+    <li><strong>Even distribution:</strong> values (and the traffic they attract) spread roughly uniformly. Sharding by country makes the China shard enormous while the New Zealand shard idles. Check for skew in both data size and request rate.</li>
+    <li><strong>Matches the access pattern:</strong> the most frequent and most latency-critical queries should include the shard key, so each is served by a single shard.</li>
+    <li><strong>Stable and not monotonic:</strong> the value shouldn't change after creation (moving a row between shards is expensive), and with range sharding it shouldn't increase over time (timestamps, auto-increment IDs concentrate all new writes on one shard).</li>
+  </ul>
+  <p>For the social app, compare two candidates. <strong>Post ID</strong> hashes beautifully: writes spread evenly across all shards. But "show me all posts by user 42" now needs to query every shard and merge the results. <strong>User ID</strong> keeps one user's posts together so that query hits one shard, but a heavy user or a celebrity concentrates load on one shard, and likes on a popular post pile onto the author's shard. <strong>There is never a perfect shard key.</strong> It depends on the dominant access pattern, and saying so out loud, then choosing one with a justification, is exactly what the interviewer wants. A common compromise: shard posts by author (so profile views are single-shard) but shard the high-volume like and view events by post ID, and aggregate counters separately.</p>
+
+  <h4>Cross-shard queries</h4>
+  <p>Any query that cannot be routed by the shard key becomes a <strong>scatter-gather</strong>: the coordinator sends the query to every shard, waits for all responses, and merges them (sorting, applying <code>LIMIT</code>, aggregating). Costs grow with shard count, and latency is set by the <em>slowest</em> shard (tail latency amplification). Mitigations: keep the common queries on the shard key, precompute and store denormalized copies keyed by the other access pattern (for example a "posts by user" table sharded by user, alongside "posts by ID"), or use a search index for ad hoc queries.</p>
+
+  <h4>Secondary indexes across shards</h4>
+  <p>What about lookups on a non-shard-key column, such as finding a user by email? There are two designs:</p>
+  <ul>
+    <li><strong>Local (document-partitioned) index:</strong> each shard indexes only its own rows. Writes are cheap and consistent (one shard), but a query by that column must scatter-gather across all shards.</li>
+    <li><strong>Global (term-partitioned) index:</strong> the index is itself sharded, by the indexed value. A lookup hits exactly one index shard, but every write now touches the data shard <em>and</em> an index shard, usually updated asynchronously (so the index can lag; DynamoDB's global secondary indexes work this way).</li>
+  </ul>
+
+  <h4>Cross-shard transactions</h4>
+  <p>Atomically updating rows on different shards (for example moving money between two accounts on different shards) requires <strong>two-phase commit</strong> or a saga, both of which are slower and more fragile than a single-node transaction. Best practice: pick a shard key so that data that must change together lives together (all of a user's rows on one shard), and push the rest to patterns built for it. See <a href="03-contention.html">Dealing with Contention</a> for coordinating concurrent updates and <a href="07-multi-step-processes.html">Multi-Step Processes</a> for sagas and workflows.</p>
+
+  <h4>Resharding</h4>
+  <p>Eventually the number of shards or their boundaries must change: data grows, or one shard turns hot. Resharding means copying data to new shards while the system keeps serving traffic, then switching routing atomically, then cleaning up. It is slow, risky and a classic source of outages. Ways to make it survivable:</p>
+  <ul>
+    <li><strong>Consistent hashing or fixed hash slots</strong> so that only a fraction of data moves.</li>
+    <li><strong>Over-provision logical shards:</strong> create many more logical shards than machines (say 1,024 logical shards on 8 servers). Rebalancing then means moving whole logical shards between machines, never splitting them. This is what Redis Cluster slots, Kafka partitions and Elasticsearch shards effectively do.</li>
+    <li><strong>Dual-write or change-data-capture to migrate online:</strong> backfill the new shards, stream ongoing changes, verify, then cut over reads and finally writes.</li>
+    <li>Use a database that does it for you (Vitess, Citus, CockroachDB, Spanner, DynamoDB, MongoDB's balancer).</li>
+  </ul>
+
+  <h3>Hot shards and hot keys</h3>
+  <p>A balanced hash does not guarantee balanced load. A single popular key (a celebrity's post, a viral video, a hot product) receives so many writes that its shard saturates even though other shards are idle. Adding shards doesn't help, because the key still lives on exactly one of them. Mitigations:</p>
+  <ul>
+    <li><strong>Key salting (suffixing):</strong> split one hot key into N sub-keys, for example <code>post:123#0</code> through <code>post:123#9</code>. Each write picks a random suffix, so the writes spread over up to N shards. The cost moves to reads: reading the total now means querying all N sub-keys and summing. Apply it only to keys known to be hot (detected by monitoring or a threshold), not to everything.</li>
+    <li><strong>Write coalescing for counters:</strong> don't update the shared row per event. Aggregate in memory and write the sum periodically (see batching below). This often removes the hot key problem entirely, since a million likes become a few hundred updates.</li>
+    <li><strong>Split hot ranges</strong> (range sharding): Bigtable, HBase, Spanner and CockroachDB automatically split a tablet or range that is too large or too busy.</li>
+    <li><strong>Avoid monotonic keys</strong> in range-sharded stores: prefix timestamps or sequential IDs with a hash or bucket to avoid "all writes go to the latest range".</li>
+    <li><strong>Isolate whales:</strong> use a directory to give a huge tenant or celebrity its own dedicated shard.</li>
+    <li><strong>Managed help:</strong> some services (DynamoDB, for instance) adapt partition capacity to skew, but with per-partition throughput limits, so a single very hot key can still be throttled. Check the service's limits instead of assuming it is infinitely elastic.</li>
+  </ul>
+
+  <h3><span class="step">Step 2</span>Choose a write-optimized storage engine</h3>
+  <p>Not every database is equally good at absorbing writes. The classic relational storage structure, the <strong>B-tree</strong>, updates pages in place: a write may need to read a page, modify it and write it back to a random disk location, plus the WAL. That is a lot of random I/O per write.</p>
+  <p><strong>LSM trees (log-structured merge trees)</strong> turn random writes into sequential ones:</p>
+  <ol>
+    <li>Each write is appended to a commit log (for durability) and inserted into an in-memory sorted structure, the <em>memtable</em>. This is fast: one sequential disk append plus a memory update.</li>
+    <li>When the memtable is full it is flushed to disk as an immutable sorted file (an <em>SSTable</em>), again sequentially.</li>
+    <li>A background <em>compaction</em> process merges many SSTables into fewer larger ones, discarding overwritten and deleted values.</li>
+    <li>Reads check the memtable and then possibly several SSTables, accelerated by Bloom filters (which cheaply say "this key is definitely not in this file").</li>
+  </ol>
+  <p>The trade is clear: writes are cheap, but reads can touch more files, and compaction causes <em>write amplification</em> (data is rewritten several times in the background) and periodic I/O spikes. LSM engines power <strong>Cassandra, ScyllaDB, HBase, Bigtable, RocksDB and LevelDB</strong> (and many databases built on RocksDB). <strong>DynamoDB</strong> is another popular choice for high write volume on key-addressed data, though its storage internals are its own. They typically also give you built-in sharding by partition key, tunable replication and consistency, and linear scale-out, at the price of limited joins, limited ad hoc queries, and eventual consistency options.</p>
+  <p>The same principle applies to the extreme case: an <strong>append-only log</strong> such as Kafka does nothing but sequentially append records, which is why it can ingest very large volumes on commodity disks. Use it as the write path for event streams and process them downstream.</p>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Very high sustained write throughput per node</li>
+      <li>Sharding and replication built in</li>
+      <li>Sequential I/O is gentle on SSDs and spinning disks</li>
+      <li>Natural fit for time-series, events, messages</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Query model limited to the key and clustering columns you designed for</li>
+      <li>Weaker transactions; often eventual consistency</li>
+      <li>Compaction overhead, tombstones, read amplification</li>
+      <li>You must model your data around queries up front</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 3</span>Handle bursts: queue, shed, batch</h3>
+  <p>Even a well-sharded system is sized for normal load. A Super Bowl ad, a flash sale or a viral post can send ten or a hundred times the usual write rate for a few minutes. You usually cannot (or do not want to) provision for the peak permanently, so you combine three tools.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 770 185" role="img" aria-label="Burst-handling pipeline: producers, then a rate limiter that sheds low priority writes, then a queue, then a batch writer, then the database. A dashed arrow shows backpressure from the queue to the producers">
+      <text class="t-a t-mid" x="212" y="22">backpressure: slow or reject producers</text>
+      <path class="l dash" d="M365 50 L365 30 L60 30 L60 48" marker-end="url(#arrow)"/>
+
+      <rect class="n" x="5" y="50" width="110" height="56" rx="8"/>
+      <text class="t t-mid" x="60" y="75">Producers</text>
+      <text class="t-s t-mid" x="60" y="92">the spike</text>
+      <rect class="n-w" x="150" y="50" width="120" height="56" rx="8"/>
+      <text class="t t-mid" x="210" y="75">Rate limit</text>
+      <text class="t-s t-mid" x="210" y="92">shed, 429</text>
+      <rect class="n-a" x="305" y="50" width="120" height="56" rx="8"/>
+      <text class="t t-mid" x="365" y="75">Queue</text>
+      <text class="t-s t-mid" x="365" y="92">SQS / RabbitMQ</text>
+      <rect class="n" x="460" y="50" width="120" height="56" rx="8"/>
+      <text class="t t-mid" x="520" y="75">Batch writer</text>
+      <text class="t-s t-mid" x="520" y="92">N rows per write</text>
+      <rect class="n-g" x="615" y="50" width="110" height="56" rx="8"/>
+      <text class="t t-mid" x="670" y="75">Database</text>
+      <text class="t-s t-mid" x="670" y="92">steady rate</text>
+
+      <line class="l" x1="115" y1="78" x2="148" y2="78" marker-end="url(#arrow)"/>
+      <line class="l" x1="270" y1="78" x2="303" y2="78" marker-end="url(#arrow)"/>
+      <line class="l" x1="425" y1="78" x2="458" y2="78" marker-end="url(#arrow)"/>
+      <line class="l" x1="580" y1="78" x2="613" y2="78" marker-end="url(#arrow)"/>
+
+      <text class="t-s t-mid" x="210" y="128">drop low priority</text>
+      <text class="t-s t-mid" x="365" y="128">absorbs the spike</text>
+      <text class="t-s t-mid" x="520" y="128">1 round trip per batch</text>
+      <text class="t-s t-mid" x="670" y="128">bounded load</text>
+      <text class="t-s" x="5" y="170">A queue only buys time: if arrivals exceed the drain rate for long enough, it grows without bound.</text>
+    </svg>
+    <figcaption>Defense in depth for write bursts: shed what you can, buffer what you must, combine what you can.</figcaption>
+  </figure>
+
+  <h4>Queues: absorb the spike</h4>
+  <p>Put a durable queue between the API and the database (SQS or RabbitMQ are the simple defaults; a log such as Kafka, Kinesis or Pulsar if you also need replay or very high throughput). The API validates the request, appends it to the queue and immediately returns <code>202 Accepted</code>. Consumers then drain the queue and write to the database at a steady rate the database can sustain. The queue converts a sharp spike into a smooth, longer stream. Writes are not lost if the database is briefly slow or down, because they wait in the queue. For the choice between a work queue and pub/sub, and between Kafka and RabbitMQ, see <a href="#messaging-models">the deep dive below</a>.</p>
+  <ul>
+    <li><strong>Partition the queue by the same key</strong> as the database shards (or by an ordering key). That keeps per-key order and lets consumers scale out in parallel, up to the number of partitions.</li>
+    <li><strong>Delivery is usually at-least-once,</strong> so consumers can see duplicates. Make writes <em>idempotent</em> (dedupe by an event ID, or use upserts).</li>
+    <li><strong>The write is now asynchronous.</strong> The user may not immediately see their own write. Use optimistic UI, or return an ID they can poll. Long jobs behind a queue are the subject of <a href="05-long-running-tasks.html">Long-Running Tasks</a>.</li>
+    <li><strong>Monitor consumer lag</strong> (how far behind the consumers are) and queue age. That is your signal for how much headroom you have left.</li>
+  </ul>
+  <p><strong>The limit of a queue.</strong> It only buys time. Suppose a spike brings 50,000 writes/second for 10 minutes into a system whose database can handle 10,000/s. The backlog grows by 40,000 per second: 40,000 x 600 = 24 million messages. If normal traffic then returns to 5,000/s, the consumers have 5,000/s of spare capacity, so draining 24 million takes 4,800 seconds, about 80 minutes. If instead the arrival rate stays above the drain rate forever, the queue grows without bound until it exhausts storage or latency becomes unacceptable. A queue is a shock absorber, not extra capacity. For a sustained increase you must raise the real throughput (more shards, more consumers).</p>
+  <p><strong>Backpressure</strong> is the control signal that closes the loop: use a <em>bounded</em> queue and, when it is full or too old, make producers slow down or fail fast (block, return an error, or return 429) instead of letting memory grow forever.</p>
+
+  <h4>Load shedding: drop the least important writes</h4>
+  <p>When you can't keep up, deliberately dropping some work is better than letting everything fail. Decide <em>in advance</em> what is expendable:</p>
+  <ul>
+    <li><strong>Prioritize by business value:</strong> payments and posts matter; likes matter less; view counts and analytics events matter least. Shed from the bottom first.</li>
+    <li><strong>Rate limit</strong> per user, per IP or per API key (token bucket or sliding window, often in Redis or at the API gateway), and return <code>429 Too Many Requests</code> with a <code>Retry-After</code> header. Well-behaved clients retry with exponential backoff and jitter.</li>
+    <li><strong>Sample</strong> low-value events: count one in ten views and multiply by ten. The statistics stay accurate for large counts.</li>
+    <li><strong>Shed early and cheaply,</strong> at the edge, before the expensive work happens. Dropping a request at the load balancer costs almost nothing; dropping it after it has consumed a database connection costs a lot.</li>
+    <li><strong>Circuit breakers</strong> stop sending traffic to a struggling dependency so it can recover.</li>
+  </ul>
+  <p>The trade-off is explicit: you are choosing to lose or reject some data, so it is only acceptable for data that is approximate or recoverable. Say which data you would never drop.</p>
+
+  <h4>Batching and write coalescing: do less work per write</h4>
+  <p>Each database write has a large fixed overhead (network round trip, parsing, transaction begin and commit, WAL flush, lock acquisition) on top of the tiny payload. Combining many small writes into one amortizes that overhead.</p>
+  <ul>
+    <li><strong>Batch inserts:</strong> <code>INSERT</code> many rows in one statement or use bulk APIs (<code>COPY</code>, Cassandra batches within one partition, DynamoDB <code>BatchWriteItem</code>), flushing every N items or every few milliseconds, whichever comes first.</li>
+    <li><strong>Coalesce counters:</strong> instead of 10,000 statements of <code>UPDATE posts SET likes = likes + 1</code> on one hot row, keep an in-memory (or Redis <code>INCR</code>) counter and flush <code>likes = likes + 10000</code> once per second. A million likes per minute against a single post becomes about 60 database updates.</li>
+    <li><strong>Stream aggregation:</strong> events flow into Kafka, a stream processor (Flink, Kafka Streams, Spark Streaming) aggregates them in windows, and only the aggregates are written.</li>
+    <li><strong>Group commit:</strong> many databases already do this internally, flushing the WAL once for a group of concurrent transactions.</li>
+  </ul>
+  <p><strong>Costs:</strong> added latency (a write waits for the batch window), and risk of loss if buffered, unflushed data lives only in the memory of a process that crashes. Mitigate by buffering into a durable log first, keeping windows short, or only batching data you can afford to lose a few seconds of.</p>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros of buffering and combining</h4><ul>
+      <li>Smooths spikes so you don't provision for the peak</li>
+      <li>Dramatically fewer database operations</li>
+      <li>Decouples the API from database health</li>
+      <li>Removes hot-row contention for counters</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Writes become delayed and eventually consistent</li>
+      <li>Duplicates and reordering must be handled</li>
+      <li>In-memory buffers can lose data on a crash</li>
+      <li>More infrastructure to run and monitor</li>
+    </ul></div>
+  </div>
+
+  <h3 id="messaging-models"><span class="step">Deep dive</span>Queues, pub/sub and brokers: which one for writes?</h3>
+  <p>"Put a queue in front of the database" hides two decisions: which <em>messaging model</em> you want (a work queue or publish/subscribe), and which <em>broker</em> implements it (Kafka, RabbitMQ, SQS and so on). They are often confused, so it is worth separating them.</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">The short answer</span>
+    <p><strong>Scaling writes through a queue is a producer/consumer problem.</strong> Each write must be applied <em>once</em>, by <em>one</em> writer, at a steady rate the database can sustain. That is a work queue with competing consumers, partitioned by the shard key.</p>
+    <p><strong>Add pub/sub on top, not instead,</strong> when the same write must also reach other systems (search index, cache invalidation, analytics, notifications). Each of those is a separate subscription with its own lag and failures.</p>
+    <p><strong>Which broker:</strong> for plain "absorb the spike and write asynchronously", <strong>a simple work queue is the default: SQS or RabbitMQ.</strong> They give you per-message acks, retries, a dead-letter queue and easy consumer scaling, with little to run. <strong>Kafka is a distributed log</strong> whose natural model is publish/subscribe. It can behave like a queue through consumer groups, but with real limits. Reach for it only when you need very high sustained volume, strict per-key ordering at scale, replay, or several downstream systems reading the same stream.</p>
+  </div>
+
+  <h4>Two messaging models</h4>
+  <ul>
+    <li><strong>Producer/consumer (point-to-point, "work queue", competing consumers).</strong> Producers put messages on a queue. Several consumers read from the <em>same</em> queue, and each message goes to <strong>exactly one</strong> of them. Once it is acknowledged, it is gone. Its purpose is to <strong>distribute work and level load</strong>, and you scale it by adding consumers.</li>
+    <li><strong>Publish/subscribe (pub/sub, "fan-out").</strong> Publishers send messages to a topic without knowing who is listening. Every <em>subscription</em> receives its <strong>own copy of every message</strong>. Its purpose is to <strong>decouple a producer from many independent interested parties</strong>. Adding a subscriber adds another reader of the same data, not more throughput for anyone else.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 250" role="img" aria-label="Left: a queue with three competing consumers, each message goes to one consumer. Right: a topic with three subscribers, each subscriber receives every message.">
+      <line class="l dash" x1="390" y1="12" x2="390" y2="236"/>
+
+      <text class="t t-mid" x="195" y="24">Producer / consumer (queue)</text>
+      <rect class="n" x="8" y="98" width="76" height="44" rx="8"/><text class="t t-mid" x="46" y="125">Producer</text>
+      <rect class="n-w" x="112" y="78" width="84" height="84" rx="8"/>
+      <text class="t t-mid" x="154" y="116">Queue</text><text class="t-s t-mid" x="154" y="134">m1 m2 m3</text>
+      <line class="l" x1="84" y1="120" x2="110" y2="120" marker-end="url(#arrow)"/>
+      <rect class="n-g" x="252" y="44" width="118" height="38" rx="8"/><text class="t t-mid" x="311" y="67">Consumer A</text>
+      <rect class="n-g" x="252" y="101" width="118" height="38" rx="8"/><text class="t t-mid" x="311" y="124">Consumer B</text>
+      <rect class="n-g" x="252" y="158" width="118" height="38" rx="8"/><text class="t t-mid" x="311" y="181">Consumer C</text>
+      <line class="l-g" x1="196" y1="108" x2="250" y2="66" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="196" y1="120" x2="250" y2="120" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="196" y1="132" x2="250" y2="174" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="195" y="218">Each message goes to ONE consumer.</text>
+      <text class="t-s t-mid" x="195" y="235">More consumers = more throughput.</text>
+
+      <text class="t t-mid" x="585" y="24">Publish / subscribe (topic)</text>
+      <rect class="n" x="398" y="98" width="76" height="44" rx="8"/><text class="t t-mid" x="436" y="125">Publisher</text>
+      <rect class="n-a" x="502" y="78" width="84" height="84" rx="8"/>
+      <text class="t t-mid" x="544" y="116">Topic</text><text class="t-s t-mid" x="544" y="134">m1 m2 m3</text>
+      <line class="l" x1="474" y1="120" x2="500" y2="120" marker-end="url(#arrow)"/>
+      <rect class="n-a" x="642" y="44" width="128" height="38" rx="8"/><text class="t t-mid" x="706" y="67">Subscriber A</text>
+      <rect class="n-a" x="642" y="101" width="128" height="38" rx="8"/><text class="t t-mid" x="706" y="124">Subscriber B</text>
+      <rect class="n-a" x="642" y="158" width="128" height="38" rx="8"/><text class="t t-mid" x="706" y="181">Subscriber C</text>
+      <line class="l-a" x1="586" y1="108" x2="640" y2="66" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="586" y1="120" x2="640" y2="120" marker-end="url(#arrow)"/>
+      <line class="l-a" x1="586" y1="132" x2="640" y2="174" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="585" y="218">Each subscriber gets EVERY message.</text>
+      <text class="t-s t-mid" x="585" y="235">Adding one adds a reader, not speed.</text>
+    </svg>
+    <figcaption>Same boxes, opposite semantics: a queue divides the messages among consumers; a topic copies them to every subscriber.</figcaption>
+  </figure>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Producer/consumer (queue)</th><th>Publish/subscribe (topic)</th></tr></thead>
+      <tbody>
+        <tr><td>Who receives a message</td><td>One consumer out of a group of competing consumers</td><td>Every subscription, each gets a copy</td></tr>
+        <tr><td>What happens to it</td><td>Removed after acknowledgement (in a log such as Kafka, retained but marked consumed by an offset)</td><td>Stays available to each subscription until that subscription has consumed it (or retention expires)</td></tr>
+        <tr><td>Adding a consumer</td><td>Drains the backlog faster (up to any partition limit)</td><td>Adds another independent reader; existing ones are unaffected</td></tr>
+        <tr><td>Failure isolation</td><td>A failing consumer's messages are retried by another consumer in the group</td><td>One slow or broken subscriber does not slow the others, it just builds its own backlog</td></tr>
+        <tr><td>Typical use</td><td>Background jobs, write buffering, load leveling</td><td>Events: "order placed", "post liked", cache invalidation, notifications</td></tr>
+        <tr><td>Examples</td><td>SQS standard queue, RabbitMQ queue with several consumers, Kafka consumer group</td><td>SNS, Google Pub/Sub, RabbitMQ fanout exchange, several Kafka consumer groups on one topic</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>The two are not mutually exclusive</h4>
+  <p>Real systems combine them: <strong>fan out first, then give every subscriber its own queue</strong>, where that subscriber's workers compete for messages.</p>
+  <ul>
+    <li><strong>SNS + SQS:</strong> publish once to an SNS topic, and each subscribing service has its own SQS queue with its own workers.</li>
+    <li><strong>RabbitMQ:</strong> a <em>fanout</em> or <em>topic</em> exchange copies each message into every bound queue. Each queue can have several competing consumers.</li>
+    <li><strong>Google Pub/Sub:</strong> a topic has several <em>subscriptions</em>. Each subscription is, in effect, a queue shared by that subscriber's workers.</li>
+    <li><strong>Kafka:</strong> one topic read by several <em>consumer groups</em>. Within a group, each partition goes to one consumer (queue semantics). Across groups, every group sees every message (pub/sub semantics).</li>
+  </ul>
+
+  <h4>Which one fits scaling writes?</h4>
+  <p>Work through what the write path needs:</p>
+  <ol>
+    <li><strong>Each write must be applied exactly once to the database.</strong> That points to a work queue with competing consumers. In a pure pub/sub fan-out where three subscribers all write the same row to the same database, you would write it three times, which is an anti-pattern.</li>
+    <li><strong>You are protecting the database's throughput.</strong> The consumers' job is to drain at a steady rate the database can sustain. More consumers means a faster drain, up to what the database allows.</li>
+    <li><strong>Align partitions with shards.</strong> Key the queue by the same key you shard on. Messages for one key go to one partition and so to one consumer. That preserves per-key order, avoids two writers fighting over the same row (see <a href="03-contention.html">Contention</a>), and lets each consumer batch writes for its own shard. The key-to-partition mapping works like the key-to-shard mapping described under <a href="#consistent-hashing">consistent hashing</a>. You do not need Kafka for this: SQS FIFO queues give per-key ordering through <em>message group IDs</em>, and with RabbitMQ you can run one queue per shard (or use a consistent-hash exchange) with one consumer each.</li>
+    <li><strong>Apply pub/sub for everything else that cares about the write.</strong> Search indexing, cache invalidation, analytics and notifications are separate consumer groups or subscriptions on the same stream. Each has its own lag and can fail or be replayed independently, without touching the write path.</li>
+    <li><strong>Make the consumers idempotent and acknowledge late.</strong> Delivery is at-least-once, so use upserts or event IDs to dedupe. Commit the offset or send the ack only <em>after</em> the database write succeeds. Acknowledging first loses a write if the consumer crashes in between.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 350" role="img" aria-label="Write path: the API publishes to a topic keyed by shard key with three partitions. Consumer group A, the database writers, takes one partition each and writes to its shard. Consumer groups B and C, a search indexer and analytics, also subscribe to the same topic independently.">
+      <rect class="n" x="8" y="140" width="90" height="50" rx="8"/><text class="t t-mid" x="53" y="170">API</text>
+      <line class="l" x1="98" y1="165" x2="138" y2="165" marker-end="url(#arrow)"/>
+
+      <rect class="n-a" x="140" y="70" width="170" height="190" rx="10"/>
+      <text class="t t-mid" x="225" y="92">Topic: writes</text>
+      <text class="t-s t-mid" x="225" y="108">keyed by shard key</text>
+      <rect class="n-w" x="156" y="122" width="138" height="34" rx="6"/><text class="t t-mid" x="225" y="144">Partition 0</text>
+      <rect class="n-w" x="156" y="170" width="138" height="34" rx="6"/><text class="t t-mid" x="225" y="192">Partition 1</text>
+      <rect class="n-w" x="156" y="218" width="138" height="34" rx="6"/><text class="t t-mid" x="225" y="240">Partition 2</text>
+
+      <text class="t-g t-mid" x="500" y="108">Consumer group A: database writers (queue semantics)</text>
+      <rect class="n-g" x="380" y="122" width="110" height="34" rx="6"/><text class="t t-mid" x="435" y="144">Writer 0</text>
+      <rect class="n-g" x="380" y="170" width="110" height="34" rx="6"/><text class="t t-mid" x="435" y="192">Writer 1</text>
+      <rect class="n-g" x="380" y="218" width="110" height="34" rx="6"/><text class="t t-mid" x="435" y="240">Writer 2</text>
+      <line class="l-g" x1="294" y1="139" x2="378" y2="139" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="294" y1="187" x2="378" y2="187" marker-end="url(#arrow)"/>
+      <line class="l-g" x1="294" y1="235" x2="378" y2="235" marker-end="url(#arrow)"/>
+      <rect class="n" x="560" y="122" width="100" height="34" rx="6"/><text class="t t-mid" x="610" y="144">Shard 0</text>
+      <rect class="n" x="560" y="170" width="100" height="34" rx="6"/><text class="t t-mid" x="610" y="192">Shard 1</text>
+      <rect class="n" x="560" y="218" width="100" height="34" rx="6"/><text class="t t-mid" x="610" y="240">Shard 2</text>
+      <line class="l" x1="490" y1="139" x2="558" y2="139" marker-end="url(#arrow)"/>
+      <line class="l" x1="490" y1="187" x2="558" y2="187" marker-end="url(#arrow)"/>
+      <line class="l" x1="490" y1="235" x2="558" y2="235" marker-end="url(#arrow)"/>
+
+      <rect class="n-a" x="380" y="276" width="170" height="34" rx="6"/><text class="t-a t-mid" x="465" y="298">Group B: search indexer</text>
+      <rect class="n-a" x="570" y="276" width="170" height="34" rx="6"/><text class="t-a t-mid" x="655" y="298">Group C: analytics</text>
+      <path class="l-a" d="M200 262 V293 H378" marker-end="url(#arrow)"/>
+      <path class="l-a" d="M250 262 V326 H655 V312" marker-end="url(#arrow)"/>
+
+      <text class="t-s" x="8" y="345">Groups B and C are pub/sub subscribers: each tracks its own offsets, has its own lag, and can fail or be replayed independently.</text>
+    </svg>
+    <figcaption>A queue for the write path (group A, one writer per partition), with pub/sub subscribers (groups B, C) hanging off the same topic.</figcaption>
+  </figure>
+
+  <h4>Kafka vs RabbitMQ</h4>
+  <p>Both can run the write path, but they are built on different ideas.</p>
+  <ul>
+    <li><strong>Kafka is a distributed commit log.</strong> A topic is split into <em>partitions</em>. Each partition is an ordered, append-only log replicated across brokers (one leader, several followers). Consumers <em>pull</em> and track their own position, called an <em>offset</em>. Messages are <strong>retained</strong> for a configured time or size (or compacted to keep the latest value per key) whether or not anyone has consumed them. Ordering is guaranteed <em>within a partition</em> only. In a consumer group each partition is read by at most one consumer, so parallelism is capped by the partition count. Producers choose the partition, usually by hashing a key.</li>
+    <li><strong>RabbitMQ is a smart broker.</strong> Producers publish to an <em>exchange</em> (types: direct, topic, fanout, headers). Bindings route the message to one or more <em>queues</em>. The broker <em>pushes</em> messages to consumers, limited by a prefetch count, and tracks each message's acknowledgement. An acknowledged message is deleted. A negative-acknowledged one is requeued or dead-lettered. It has per-message and per-queue TTLs, priority queues, dead-letter exchanges and flexible routing built in. Quorum queues (Raft-replicated) are the durable choice, and a separate <em>streams</em> feature offers a Kafka-like replayable log.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Kafka</th><th>RabbitMQ</th></tr></thead>
+      <tbody>
+        <tr><td>Core model</td><td>Partitioned, replicated, retained log; consumers pull and track offsets</td><td>Exchanges and queues; broker pushes and tracks per-message acks</td></tr>
+        <tr><td>Throughput</td><td>Very high: commonly hundreds of thousands to millions of messages per second across a cluster, thanks to sequential I/O and batching</td><td>Good: commonly tens of thousands of messages per second per node, depending on message size and durability settings</td></tr>
+        <tr><td>Latency</td><td>Low, with some batching delay</td><td>Very low for individual messages</td></tr>
+        <tr><td>Ordering</td><td>Strict within a partition; none across partitions</td><td>FIFO within a queue, but with several consumers or redeliveries order is not preserved</td></tr>
+        <tr><td>Retention and replay</td><td>Built in: re-read from any offset, rebuild a new consumer from history</td><td>Messages are deleted once acknowledged (replay only with streams)</td></tr>
+        <tr><td>Scaling consumers</td><td>Up to the number of partitions per group; rebalances when consumers join or leave</td><td>Add consumers to a queue freely; messages are spread among them</td></tr>
+        <tr><td>Retries, delays, priorities</td><td>Not built in. You build retry topics, delayed topics and separate topics per priority</td><td>Built in: nack and requeue, TTLs, dead-letter exchanges, priority queues</td></tr>
+        <tr><td>Routing</td><td>Topic and partition key only</td><td>Rich: direct, topic patterns, fanout, headers</td></tr>
+        <tr><td>Operations</td><td>More to size and tune (partitions, replication, retention). Recent versions run without ZooKeeper (KRaft)</td><td>Simpler to start. Needs care with queue growth and memory, and clustering across regions is awkward</td></tr>
+        <tr><td>Natural identity</td><td>Event log with publish/subscribe semantics. Queue behaviour comes from consumer groups, within the partition limits above</td><td>Work queue. Competing consumers, per-message ack and retry are the core model (SQS plays the same role on AWS)</td></tr>
+        <tr><td>Best fit</td><td>High-volume ingest, per-key ordering, replay, many downstream consumers, stream processing. Overkill for simply offloading work asynchronously</td><td>Async offload, task queues, request routing, per-message retry and priority logic, moderate volume</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Choosing for a write path.</strong> Start from the job: you want a durable buffer that smooths a spike, with a retry and a dead-letter queue, so the database is written at a steady rate. That is exactly what <strong>SQS or RabbitMQ</strong> are built for, they are simple to operate, and they are the right default. SQS is the zero-ops choice on AWS; RabbitMQ is the choice when you also want rich routing, priorities or low latency and can run a broker.</p>
+  <p><strong>Move to Kafka only when you can name the reason:</strong></p>
+  <ul>
+    <li><strong>Sustained very high volume</strong> (say 100K or more writes per second), where a log's sequential I/O and batching matter.</li>
+    <li><strong>Strict per-key ordering at that scale</strong>, via partitions.</li>
+    <li><strong>Replay:</strong> you need to re-read history to rebuild a consumer, fix a bug, or backfill a new system.</li>
+    <li><strong>Many independent consumers</strong> of the same stream (the pub/sub side of Kafka), such as search, analytics and a data lake.</li>
+  </ul>
+  <p>If none of those apply, Kafka adds partition planning, rebalances, and retry topics you must build yourself, for no benefit. Other managed options include Kinesis, Google Pub/Sub, and Apache Pulsar (which supports both queue-style and pub/sub-style subscriptions). Redpanda speaks the Kafka protocol with a different implementation.</p>
+
+  <h4>Pitfalls specific to this choice</h4>
+  <ul>
+    <li><strong>Plan the partition count up front.</strong> It caps consumer parallelism. Adding partitions later changes the key-to-partition mapping (with default hash-modulo placement), which can break per-key ordering during the change. Over-provision moderately instead of starting at one.</li>
+    <li><strong>Hot keys make hot partitions.</strong> One viral key sends all its traffic to one partition and one consumer. Salt the key or coalesce before enqueueing (see <em>Hot shards and hot keys</em> above).</li>
+    <li><strong>Watch consumer lag.</strong> It is your headroom signal. Alert on lag growth and on the age of the oldest message.</li>
+    <li><strong>Rebalances pause consumption.</strong> When consumers join or leave a Kafka group, partitions are reassigned and processing briefly stalls. Avoid flapping consumers.</li>
+    <li><strong>At-least-once means duplicates.</strong> Make writes idempotent, and commit or ack after the database write, never before.</li>
+    <li><strong>A poison message blocks its partition.</strong> In an ordered log, one message that always fails stops everything behind it. Send it to a dead-letter or retry topic after a few attempts.</li>
+    <li><strong>Retention is a cost and a promise.</strong> Longer retention allows deeper replay but costs disk. Size it for how far back you may need to rebuild a consumer.</li>
+  </ul>
+
+  <div class="callout interview">
+    <span class="callout-title">If asked: queue or pub/sub, Kafka or RabbitMQ?</span>
+    <blockquote>"For the write path itself I want a work queue with competing consumers, because each write must be applied once at a rate the database can take. My default is a simple managed queue like SQS, or RabbitMQ, since they give me acks, retries and a dead-letter queue with little to run. I'd key it by the shard key so each key has one writer and order is kept. I'd only move to Kafka if I needed very high sustained throughput, replay, or several other systems, like search and analytics, reading the same events as separate consumer groups."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>Every technique here trades something away. Be ready to name the cost of each choice.</p>
+
+  <h3>Sharding adds permanent complexity</h3>
+  <p>You pay for sharding forever: routing logic, schema migrations across N databases, backups, monitoring per shard, and a much harder debugging story. Delay it as long as the numbers allow, and prefer a database that shards for you.</p>
+
+  <h3>The shard key locks in your access patterns</h3>
+  <p>Queries on the shard key are fast and everything else is scatter-gather or needs a secondary structure. Changing the shard key later means migrating all data. Choose it from the dominant access pattern, and say what you gave up.</p>
+
+  <h3>Hot partitions</h3>
+  <p>Uneven keys, skewed tenants and celebrities create hot shards that no amount of horizontal scaling fixes. Salting, coalescing, range splitting and isolation are the toolkit; monitor per-shard and per-key traffic to catch it early.</p>
+
+  <h3>Consistency across shards</h3>
+  <p>Joins, global uniqueness constraints, and multi-row transactions that span shards are costly or unavailable. Keep related data on one shard, or use sagas and idempotent steps (see <a href="07-multi-step-processes.html">Multi-Step Processes</a>) and accept eventual consistency where the business allows.</p>
+
+  <h3>Resharding and rebalancing</h3>
+  <p>Moving data under live traffic is slow and risky. Use consistent hashing or many logical shards, rate-limit the migration so it doesn't starve production traffic, and rehearse it.</p>
+
+  <h3>Asynchrony and idempotency</h3>
+  <p>Queues, batching and retries mean writes can be delayed, duplicated or reordered. Design consumers to be idempotent, use event IDs for dedupe, and be explicit about what users see while writes are in flight.</p>
+
+  <h3>Durability versus throughput</h3>
+  <p>Almost every speed-up here (group commit, async replication, in-memory buffers, relaxed fsync) widens a window in which an acknowledged write can still be lost. Match the setting to the data: be strict for money and orders, relaxed for views and telemetry.</p>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Options</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Sharded relational</td><td>Vitess (MySQL), Citus (PostgreSQL), CockroachDB, YugabyteDB, Google Spanner, MongoDB (sharded clusters)</td><td>Keep SQL and (some) transactions while the system handles shard routing, splitting and rebalancing. Still design around the shard key.</td></tr>
+        <tr><td>Write-optimized wide-column / key-value</td><td>Cassandra, ScyllaDB, DynamoDB, HBase, Bigtable</td><td>Built for huge write volume, partitioned by key from day one. Model tables around your queries. Beware hot partitions and per-partition limits.</td></tr>
+        <tr><td>Embedded LSM engines</td><td>RocksDB, LevelDB</td><td>Used inside many databases and stream processors. Rarely chosen directly in an interview, but good to name when explaining LSM trees.</td></tr>
+        <tr><td>Time-series and analytics ingestion</td><td>TimescaleDB, InfluxDB, ClickHouse, Apache Druid, Pinot</td><td>Optimized for high-rate appends, time partitioning and fast aggregation. Often fed from a queue.</td></tr>
+        <tr><td>Queues and logs</td><td>Apache Kafka, Amazon SQS, Kinesis, Google Pub/Sub, Pulsar, RabbitMQ</td><td>SQS or RabbitMQ as the default for simple async write offload. Kafka for very high throughput, partitioned and replayable logs, and many consumers of one stream (size partitions for the parallelism you need). See <a href="#messaging-models">queue vs pub/sub and Kafka vs RabbitMQ</a>.</td></tr>
+        <tr><td>Counters and rate limiting</td><td>Redis (<code>INCR</code>, token bucket scripts), API gateways, Envoy, Nginx</td><td>Fast in-memory counters for coalescing and limiting. Flush aggregates to the durable store.</td></tr>
+        <tr><td>Stream aggregation</td><td>Apache Flink, Kafka Streams, Spark Structured Streaming</td><td>Windowed counts and sums so the database receives aggregates instead of raw events.</td></tr>
+        <tr><td>Cluster metadata and membership</td><td>etcd, ZooKeeper, Consul, gossip protocols</td><td>Where the ring, slot map or shard directory lives and how nodes learn about changes.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <ul>
+    <li><strong>You haven't hit the limits of one node.</strong> A tuned, well-provisioned database with sensible indexes handles a surprising amount of write traffic. Sharding "just in case" buys you pain without benefit. Do the math first.</li>
+    <li><strong>The bottleneck is reads.</strong> If the system is read-heavy, caching and replicas (see <a href="01-scaling-reads.html">Scaling Reads</a>) are cheaper and simpler than sharding.</li>
+    <li><strong>The workload is dominated by cross-entity transactions or joins.</strong> If most operations must atomically touch data that cannot be co-located, sharding makes them slow or impossible. Consider a scale-up first, or a distributed SQL database, or rethink the data model.</li>
+    <li><strong>A single hot item is the real problem.</strong> If one key carries the load, more shards won't help. Use coalescing, salting or <a href="03-contention.html">contention</a> techniques instead.</li>
+    <li><strong>The load is sustained, not bursty.</strong> A queue cannot fix a permanent capacity shortfall. It only postpones the failure.</li>
+    <li><strong>Data can't be dropped, delayed or reordered.</strong> If every write must be synchronous, immediately visible and strictly ordered across the system (for example a ledger), avoid load shedding and heavy batching and look for strong-consistency designs.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"This is write-heavy: about 100K writes per second at peak, which is more than one primary can take. Replicas won't help, because every replica still applies every write. So I'd first confirm one tuned node can't do it, then shard. I'd hash-shard the likes and views by post ID so writes spread evenly, using consistent hashing with virtual nodes so adding a shard only moves a small slice of data, and keep each shard replicated for availability. The trade-off is that 'all posts by a user' becomes scatter-gather, so I'd keep a second table sharded by user ID for that query. For a viral post, the hot key is a problem, so I'd coalesce like counters in memory and flush every second, or salt the counter key. For bursts, I'd put a durable work queue in front, SQS or RabbitMQ by default, keyed by post ID so each post has one writer, rate limit and shed low-priority events like view counts first, and batch the writes into the database. I'd only move to Kafka if I needed replay or other consumers, like search and analytics, reading the same stream. I'd watch consumer lag, because a queue only buys time if the spike never ends."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>Why don't read replicas help with write scaling?</summary>
+    <div class="answer">
+      <p>Replication works by shipping every change from the primary to each replica and having the replica apply it. So each replica performs the same write work as the primary. Adding replicas multiplies read capacity, but the write capacity of the system is still bounded by what one machine can apply. Even in multi-primary setups, each primary must eventually apply every write, and you add conflict resolution on top. To scale writes you have to partition the data so each machine handles only part of it.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How would you choose a shard key for a social app's posts and likes?</summary>
+    <div class="answer">
+      <p>Start from the access patterns. Likes and views are huge in volume, are written per post, and are read as per-post counts, so sharding them by post ID spreads writes evenly and makes the per-post lookup single-shard. The cost is that "posts liked by user X" would scatter, so I'd keep a separate table keyed by user for that query. Posts themselves might be sharded by author so profile pages hit one shard, accepting that very active users skew load, which I'd handle by monitoring and isolating whales. I'd avoid country (badly skewed) and timestamp (monotonic, so one shard takes all new writes). The key point is that there is no perfect key; I name the dominant query and optimize for it.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Why consistent hashing instead of hash(key) % N, and what are virtual nodes for?</summary>
+    <div class="answer">
+      <p>With modulo, changing N changes the shard of roughly N/(N+1) of all keys (75% going from 3 to 4 shards), forcing a huge data migration or a cache-miss storm. Consistent hashing puts nodes and keys on one ring and assigns each key to the next node clockwise, so adding or removing a node only moves the keys in one arc, roughly K/N keys, and only between that node and its neighbor. Plain consistent hashing with few nodes has uneven arcs, and a dead node dumps everything on one neighbor. Virtual nodes put each physical machine at many (often 100 to 256) positions on the ring, which evens out load, lets bigger machines take more vnodes, and spreads a failed or new node's data across many peers. Remaining caveats: it doesn't fix hot keys, the membership map still has to be distributed (gossip, etcd), and moved data still has to be streamed.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>One celebrity's post is getting millions of likes and its shard is melting. What do you do?</summary>
+    <div class="answer">
+      <p>Adding shards doesn't help since the key is on one shard. First coalesce: buffer likes in memory or Redis and flush an aggregate count every second or so, which turns millions of writes into a few updates. If the key must take raw writes, salt it into N sub-keys (<code>post:123#0..N-1</code>), write to a random one, and sum on read, accepting a more expensive read for hot keys only. Longer term, detect hot keys by monitoring, give very hot entities their own capacity via a directory, and decide whether like counts need to be exact or can be approximate and eventually consistent.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Queue, load shedding or batching: which do you use for a sudden spike, and what if it doesn't end?</summary>
+    <div class="answer">
+      <p>They solve different parts. Batching reduces the cost per write, which raises effective capacity at all times. A queue absorbs a temporary excess and drains it later, but only if average arrival rate is below the drain rate. Load shedding protects the system when even that isn't enough, by dropping the least valuable writes (views before likes before posts) and rejecting excess with 429. If the spike never ends, the queue grows without bound, so you need real capacity: more shards, more consumers (bounded by partition count), and backpressure so producers are throttled. Monitor consumer lag to know which regime you are in.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Should the write queue be a work queue or pub/sub?</summary>
+    <div class="answer">
+      <p>A work queue (producer/consumer with competing consumers). Each write must be applied once, by one writer, so a message should go to exactly one consumer. Fan-out would apply it several times to the same database. Use pub/sub for the <em>other</em> things that care about the write (search, cache invalidation, analytics), as separate subscriptions on the same stream so their lag and failures stay independent of the write path.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Kafka or RabbitMQ for the write path?</summary>
+    <div class="answer">
+      <p>For simply offloading writes asynchronously, a work queue is the better default: RabbitMQ, or SQS on AWS. You get per-message acks, retries with dead-letter queues, routing, priorities and delays out of the box, and simple operations. Kafka is a retained log whose natural model is pub/sub. It earns its complexity when you have very high sustained throughput, ordering per key at scale (partition by shard key), a need to replay history, or several downstream consumers on the same stream, and it costs you retries, delays and priorities that you build yourself, plus careful partition planning. State the write rate, the ordering requirement and whether anything else needs the stream, then pick.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How can Kafka behave as both a queue and as pub/sub?</summary>
+    <div class="answer">
+      <p>Through consumer groups. Within one group, each partition is assigned to a single consumer, so the group's consumers share the work: queue semantics. Different groups each track their own offsets and each receives every message: pub/sub semantics. So the database writers form one group, and a search indexer and an analytics job each form their own group on the same topic. Note that Kafka's native strength is the second behaviour, pub/sub over a retained log. Its queue behaviour is real but constrained: parallelism is capped by partition count, there is no per-message ack or retry, and one poison message blocks its partition. That is why a plain work queue is usually the simpler choice when all you need is async offload.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you handle transactions and resharding in a sharded system?</summary>
+    <div class="answer">
+      <p>Avoid cross-shard transactions by choosing a shard key that co-locates data which must change together, and by denormalizing. When you can't, use two-phase commit (a distributed SQL database does this for you, at a latency cost) or a saga of idempotent steps with compensations. For resharding, avoid modulo placement. Use consistent hashing or many fixed logical shards (for example 1,024 slots over 8 machines) so rebalancing means moving whole slots, backfill the new location while streaming ongoing changes, verify, switch routing, then delete old data, rate-limiting the copy so production traffic isn't starved.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="01-scaling-reads.html">01 · Scaling Reads</a></li>
+    <li><a href="03-contention.html">03 · Dealing with Contention (hot rows, cross-shard coordination)</a></li>
+    <li><a href="05-long-running-tasks.html">05 · Long-Running Tasks (queues and workers)</a></li>
+    <li><a href="06-real-time-updates.html">06 · Real-Time Updates (consistent hash ring for stateful servers)</a></li>
+    <li><a href="07-multi-step-processes.html">07 · Multi-Step Processes (sagas across shards)</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>

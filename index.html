@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System Design Patterns — The 8 Patterns That Keep Coming Up</title>
+<meta name="description" content="A tutorial on the eight most common system design interview patterns: scaling reads, scaling writes, contention, large blobs, long-running tasks, real-time updates, multi-step processes and proximity search.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="index" data-root="">
+<div class="shell">
+<main>
+<div class="content wide">
+
+<header class="hero">
+  <span class="eyebrow">A tutorial</span>
+  <h1>The 8 system design patterns that keep coming up</h1>
+  <p class="lede">The same engineering problems appear again and again across very different products. Learn to recognize the pattern, apply the standard solution, and spend your time on the decisions that make a particular problem interesting.</p>
+  <div class="meta">
+    <span class="chip">8 patterns</span>
+    <span class="chip">What, why and how</span>
+    <span class="chip">Trade-offs</span>
+    <span class="chip">Interview scripts</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="why">Why patterns?</h2>
+  <p>The more system design problems you look at, the more you notice that the underlying problems repeat:</p>
+  <ul>
+    <li><strong>Uber and Yelp</strong>: both work with location data and must efficiently find what is <em>near</em> a point.</li>
+    <li><strong>Ticketmaster and Airbnb</strong>: when two people try to buy the last seat, or book the same property for the same night, only one may win.</li>
+    <li><strong>YouTube and Dropbox</strong>: uploading a 4 GB file raises the same challenges whether it is a video or a document.</li>
+  </ul>
+  <p>Strong candidates recognize these patterns almost immediately. They already know how to handle the common problem, which frees up the time to go deep on whatever makes that question hard. The goal is not to invent novel solutions to problems the industry solved decades ago. It is to <strong>recognize the pattern, apply what you already know, and focus on the decisions that matter.</strong></p>
+</section>
+
+<section>
+  <h2 id="patterns">The eight patterns</h2>
+  <p>Each pattern has its own page covering the problem, the solutions in the order you would reach for them, the trade-offs an interviewer will probe, technologies, when <em>not</em> to use it, and an interview script.</p>
+
+  <div class="cards">
+    <a class="card" href="patterns/01-scaling-reads.html">
+      <span class="num">PATTERN 01</span>
+      <h3>Scaling Reads</h3>
+      <p>Reads outgrow what your database can serve. Indexes, replicas, caches and CDNs, and the staleness each one brings.</p>
+      <span class="signal"><b>Signal:</b> feeds, catalogues, "mostly browsing"</span>
+    </a>
+    <a class="card" href="patterns/02-scaling-writes.html">
+      <span class="num">PATTERN 02</span>
+      <h3>Scaling Writes</h3>
+      <p>Replicas don't help writes. Shard the data, choose a shard key, understand consistent hashing, and absorb bursts.</p>
+      <span class="signal"><b>Signal:</b> likes, views, events, telemetry</span>
+    </a>
+    <a class="card" href="patterns/03-contention.html">
+      <span class="num">PATTERN 03</span>
+      <h3>Dealing with Contention</h3>
+      <p>Many users change the same data at once. Conditional writes, locks, optimistic concurrency control, and what changes across databases.</p>
+      <span class="signal"><b>Signal:</b> last ticket, bidding, booking, matching</span>
+    </a>
+    <a class="card" href="patterns/04-large-blobs.html">
+      <span class="num">PATTERN 04</span>
+      <h3>Handling Large Blobs</h3>
+      <p>Move big files around without choking your servers: pre-signed URLs, chunked uploads, CDN downloads, and keeping metadata honest.</p>
+      <span class="signal"><b>Signal:</b> photos, videos, documents</span>
+    </a>
+    <a class="card" href="patterns/05-long-running-tasks.html">
+      <span class="num">PATTERN 05</span>
+      <h3>Long-Running Tasks</h3>
+      <p>Work that outlasts a request. Queues, workers, job IDs, retries and dead letter queues, and when to stay synchronous.</p>
+      <span class="signal"><b>Signal:</b> transcoding, reports, bulk email</span>
+    </a>
+    <a class="card" href="patterns/06-real-time-updates.html">
+      <span class="num">PATTERN 06</span>
+      <h3>Real-Time Updates</h3>
+      <p>Tell the client the moment something happens. Polling, SSE, WebSockets, pub/sub, and routing with a consistent hash ring.</p>
+      <span class="signal"><b>Signal:</b> chat, notifications, live scores, progress bars</span>
+    </a>
+    <a class="card" href="patterns/07-multi-step-processes.html">
+      <span class="num">PATTERN 07</span>
+      <h3>Multi-Step Processes</h3>
+      <p>Several services coordinating over hours or days. The saga pattern and durable workflow engines like Temporal and Step Functions.</p>
+      <span class="signal"><b>Signal:</b> checkout, onboarding, anything with "then wait for…"</span>
+    </a>
+    <a class="card" href="patterns/08-proximity-search.html">
+      <span class="num">PATTERN 08</span>
+      <h3>Proximity Search</h3>
+      <p>Find things near a location. Why ordinary indexes fail in two dimensions, and geohash, quadtrees, S2 and H3.</p>
+      <span class="signal"><b>Signal:</b> "nearby", "within 2 miles", drivers, stores</span>
+    </a>
+  </div>
+</section>
+
+<section>
+  <h2 id="deepdives">Concepts worth knowing cold</h2>
+  <p>Three techniques come up inside several patterns. Each has a "why it exists" and a "how it works" write-up on the page where it matters most:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>Why it exists</th><th>Read it in</th></tr></thead>
+      <tbody>
+        <tr><td>Consistent hashing</td><td>Add or remove a shard or server without remapping almost every key.</td><td><a href="patterns/02-scaling-writes.html">02 · Scaling Writes</a>, applied in <a href="patterns/06-real-time-updates.html">06 · Real-Time Updates</a></td></tr>
+        <tr><td>Optimistic concurrency control</td><td>Avoid holding locks when conflicts are rare; detect and retry instead.</td><td><a href="patterns/03-contention.html">03 · Dealing with Contention</a></td></tr>
+        <tr><td>Queue vs pub/sub, Kafka vs RabbitMQ</td><td>Pick the right messaging model: one worker per message (work queue) or every subscriber gets every message (pub/sub).</td><td><a href="patterns/02-scaling-writes.html#messaging-models">02 · Scaling Writes</a>, also referenced in <a href="patterns/05-long-running-tasks.html">05</a> and <a href="patterns/06-real-time-updates.html">06</a></td></tr>
+        <tr><td>Saga pattern</td><td>Keep a business process consistent across services without a distributed transaction.</td><td><a href="patterns/07-multi-step-processes.html">07 · Multi-Step Processes</a>, summarized in <a href="patterns/03-contention.html">03</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="spot">Spotting the pattern</h2>
+  <p>A quick lookup from what you hear in the prompt to where to look first.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>If the requirement says…</th><th>Think</th><th>First move</th></tr></thead>
+      <tbody>
+        <tr><td>"Millions of users browsing", read-to-write 10:1 to 100:1</td><td><a href="patterns/01-scaling-reads.html">Scaling Reads</a></td><td>Indexes, then replicas, then cache</td></tr>
+        <tr><td>"Every action is a write", write volume beyond one DB</td><td><a href="patterns/02-scaling-writes.html">Scaling Writes</a></td><td>Shard on a well-chosen key; queue the bursts</td></tr>
+        <tr><td>"Two people, one item", "exactly once", "no double booking"</td><td><a href="patterns/03-contention.html">Contention</a></td><td>Conditional write inside one database</td></tr>
+        <tr><td>"Upload a video / file", "download large files"</td><td><a href="patterns/04-large-blobs.html">Large Blobs</a></td><td>Pre-signed URL straight to object storage</td></tr>
+        <tr><td>"Takes minutes", "generate a report", "transcode"</td><td><a href="patterns/05-long-running-tasks.html">Long-Running Tasks</a></td><td>Queue + workers, return a job ID</td></tr>
+        <tr><td>"Show it instantly", "live", "notify the user"</td><td><a href="patterns/06-real-time-updates.html">Real-Time Updates</a></td><td>Start with polling; escalate to SSE / WebSockets</td></tr>
+        <tr><td>"Charge, reserve, ship, then confirm", spans days</td><td><a href="patterns/07-multi-step-processes.html">Multi-Step Processes</a></td><td>A workflow engine (Temporal / Step Functions)</td></tr>
+        <tr><td>"Nearby", "within N km", "closest driver"</td><td><a href="patterns/08-proximity-search.html">Proximity Search</a></td><td>A geospatial index (PostGIS, Redis GEO, Elasticsearch)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="combining">Combining patterns: YouTube</h2>
+  <p>In a real interview you will usually use several patterns at once. Take YouTube:</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 190" role="img" aria-label="YouTube combines four patterns: large blobs for upload, long-running tasks for transcoding, real-time updates for progress, and multi-step processes to coordinate publishing">
+      <rect class="n-a" x="10" y="40" width="160" height="64" rx="10"/>
+      <text class="t t-mid" x="90" y="68">Upload video</text><text class="t-a t-mid" x="90" y="88">04 · Large Blobs</text>
+      <rect class="n-a" x="210" y="40" width="160" height="64" rx="10"/>
+      <text class="t t-mid" x="290" y="68">Transcode</text><text class="t-a t-mid" x="290" y="88">05 · Long-Running Tasks</text>
+      <rect class="n-a" x="410" y="40" width="160" height="64" rx="10"/>
+      <text class="t t-mid" x="490" y="68">Show progress</text><text class="t-a t-mid" x="490" y="88">06 · Real-Time Updates</text>
+      <rect class="n-g" x="610" y="40" width="160" height="64" rx="10"/>
+      <text class="t t-mid" x="690" y="68">Publish</text><text class="t-g t-mid" x="690" y="88">Watch: 01 · Scaling Reads</text>
+      <line class="l" x1="170" y1="72" x2="208" y2="72" marker-end="url(#arrow)"/>
+      <line class="l" x1="370" y1="72" x2="408" y2="72" marker-end="url(#arrow)"/>
+      <line class="l" x1="570" y1="72" x2="608" y2="72" marker-end="url(#arrow)"/>
+      <path class="l-a dash" d="M20 120 H760 V138 H20 Z" style="fill:none"/>
+      <text class="t-a t-mid" x="390" y="160">07 · Multi-Step Processes coordinates the whole pipeline from upload to publish</text>
+    </svg>
+    <figcaption>One product, five patterns. Each box is a problem you already know how to approach.</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>Uploading</strong> a video means <a href="patterns/04-large-blobs.html">large files</a>: pre-signed URLs and chunked uploads.</li>
+    <li><strong>Transcoding</strong> takes minutes, so it runs as a <a href="patterns/05-long-running-tasks.html">long-running task</a> on a worker pool.</li>
+    <li><strong>Progress</strong> reaches the uploader via <a href="patterns/06-real-time-updates.html">real-time updates</a>.</li>
+    <li><strong>Coordinating</strong> everything from upload to publish is a <a href="patterns/07-multi-step-processes.html">multi-step process</a>.</li>
+    <li>Once published, billions of views are a <a href="patterns/01-scaling-reads.html">read-scaling</a> problem.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="approach">How to use this in an interview</h2>
+  <ol>
+    <li><strong>Recognize.</strong> Match the requirement to a pattern using the signals above.</li>
+    <li><strong>Apply the standard solution.</strong> Start with the simplest rung of the ladder and say why you would escalate.</li>
+    <li><strong>Name the trade-offs.</strong> Every pattern has a characteristic cost: staleness, hot keys, lost ordering, duplicate delivery. Naming them before you're asked is a strong signal.</li>
+    <li><strong>Don't over-engineer.</strong> Several patterns come with a warning: don't shard before you need to, don't go async if the work takes 200 ms, don't reach for WebSockets before polling stops being enough, and don't build a geospatial index for a thousand rows.</li>
+    <li><strong>Go deep where the problem is unique.</strong> The time you save on the standard parts is what you spend on the genuinely interesting decisions.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-title">Where to start</span>
+    <p>Read the patterns you are least sure about first. Each page opens with a TL;DR and a "recognize it when…" box, so you can skim the summary and then dive into the sections that matter.</p>
+  </div>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="assets/main.js"></script>
+</body>
+</html>

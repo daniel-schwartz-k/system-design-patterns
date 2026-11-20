@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proximity Search — System Design Patterns</title>
+<meta name="description" content="How to find things near a location: why ordinary indexes fail on two dimensions, and how geohash, quadtrees, R-trees, S2 and H3 let a query throw away most of the world.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="08" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 08 of 08</span>
+  <h1>Proximity Search</h1>
+  <p class="lede">"Find the drivers near this rider." An ordinary database index sorts along one line, but a location is a point on a plane. A geospatial index cuts the map into regions so a query can discard almost the whole world before it examines a single row.</p>
+  <div class="meta">
+    <span class="chip">Geospatial index</span>
+    <span class="chip">Geohash / quadtree / R-tree</span>
+    <span class="chip">S2 &amp; H3</span>
+    <span class="chip">Ride sharing &amp; local search</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p>Proximity search answers: <em>"which items are within some distance of this point?"</em> or <em>"which are the K closest?"</em>. The core difficulty is that a normal index is one-dimensional, while "near" depends on <strong>latitude and longitude together</strong>. The fix is to turn two dimensions into something an index can handle by <strong>dividing the map into cells</strong> and indexing items by the cell they fall in. Climb this ladder and stop when it is good enough:</p>
+  <ol>
+    <li><strong>Brute force / bounding box + exact distance.</strong> Fine for a few thousand rows.</li>
+    <li><strong>Grid or geohash.</strong> Encode a location as a string whose prefix identifies its cell; search your own cell plus its 8 neighbors, then filter by true distance.</li>
+    <li><strong>Quadtree or R-tree.</strong> Tree structures that adapt to density, so a crowded city is cut finely and an empty desert is not.</li>
+    <li><strong>S2 or H3.</strong> Hierarchical cell systems on a sphere, used by Google and Uber, with clean neighbor handling and multiple resolutions.</li>
+  </ol>
+  <p>In practice <strong>you rarely build any of this yourself</strong>. PostGIS, Redis geo commands, Elasticsearch geo queries and MongoDB <code>2dsphere</code> indexes give it to you. The design decisions that remain are about the <em>shape of your data</em>: places that almost never move (Yelp) versus things that move constantly (Uber drivers), and what you combine the distance search with (filters, ranking, ETA).</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>The prompt says "nearby", "within N miles", "closest", "around me" or "in this area".</li>
+      <li>You are designing Uber, Lyft, DoorDash, GoPuff, Yelp, Google Maps places, Tinder, Airbnb map search, or "find a store".</li>
+      <li>Every query carries a location, and the answer set is a tiny fraction of all the data.</li>
+      <li>Items have coordinates and the main filter is distance, often together with other filters (open now, category, rating).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>Suppose you store restaurants in a table with <code>lat</code> and <code>lon</code> columns and a user asks for restaurants within 2 miles. You have no good way to ask the database that question quickly. To see why, recall what an index is.</p>
+
+  <h3>Why a normal index fails</h3>
+  <p>A B-tree keeps keys in a <strong>single sorted order</strong>. It answers "give me everything between A and B" extremely well, but only along that one ordering. "Near me" is a <strong>two-dimensional</strong> question: a circle on the map.</p>
+  <ul>
+    <li><strong>Index on <code>lat</code> alone.</strong> <code>WHERE lat BETWEEN 37.76 AND 37.79</code> returns every row in a <em>horizontal band</em> around the whole planet at that latitude. A band 3 km tall circles the globe and contains cities in every longitude. The index narrowed one dimension and did nothing for the other, so the database still examines (and then discards) the vast majority of the band.</li>
+    <li><strong>Composite index on <code>(lat, lon)</code>.</strong> This sorts by latitude first, then longitude <em>within equal latitudes</em>. Because latitude is a continuous value, nearly every row has a unique latitude, so the longitude part is almost never used to narrow the range. It behaves like the single-column index. (This is the leftmost-prefix rule from <a href="01-scaling-reads.html">Scaling Reads</a>: only the first column of a range predicate can seek.)</li>
+    <li><strong>Two separate indexes</strong> (one on lat, one on lon) means the planner fetches two huge sets and intersects them. Better than nothing, but each set is still a whole band or a whole meridian strip.</li>
+    <li><strong>Sorting by distance</strong> (<code>ORDER BY distance LIMIT 10</code>) cannot use any of these indexes at all, because distance to <em>this user</em> is a computed value that no pre-sorted index contains. The database must compute it for every candidate row.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 335" role="img" aria-label="A map with a small search circle. A latitude band that a one-dimensional index would scan stretches across the whole map, while the small box around the circle is all that is actually needed.">
+      <rect class="n" x="20" y="10" width="720" height="240" rx="8"/>
+      <rect class="n-w" x="20" y="100" width="720" height="80"/>
+      <rect class="n-g" x="350" y="110" width="60" height="60"/>
+      <circle class="l-a" cx="380" cy="140" r="28"/>
+      <circle class="n-a" cx="380" cy="140" r="4"/>
+      <circle class="n" cx="70" cy="125" r="3"/><circle class="n" cx="110" cy="160" r="3"/><circle class="n" cx="160" cy="118" r="3"/>
+      <circle class="n" cx="230" cy="150" r="3"/><circle class="n" cx="290" cy="128" r="3"/><circle class="n" cx="330" cy="165" r="3"/>
+      <circle class="n" cx="440" cy="120" r="3"/><circle class="n" cx="500" cy="158" r="3"/><circle class="n" cx="560" cy="130" r="3"/>
+      <circle class="n" cx="620" cy="166" r="3"/><circle class="n" cx="680" cy="122" r="3"/><circle class="n" cx="710" cy="152" r="3"/>
+      <text class="t-s t-mid" x="190" y="92">Index on latitude scans this whole band</text>
+      <text class="t-s t-mid" x="570" y="92">same latitude, thousands of km away</text>
+      <rect class="n-w" x="20" y="268" width="22" height="13" rx="3"/>
+      <text class="t-s" x="52" y="279">Rows a latitude-range index must read (whole band, all longitudes)</text>
+      <rect class="n-g" x="20" y="290" width="22" height="13" rx="3"/>
+      <text class="t-s" x="52" y="301">The tiny bounding box that could actually contain answers</text>
+      <circle class="l-a" cx="31" cy="319" r="6"/>
+      <text class="t-s" x="52" y="323">The true search circle (radius r around the query point)</text>
+    </svg>
+    <figcaption>A one-dimensional index narrows latitude but not longitude, so it reads a band wrapped around the planet. A spatial index jumps straight to the small box.</figcaption>
+  </figure>
+
+  <h3>The numbers that make this hurt</h3>
+  <p>Uber-scale data makes the naive approach untenable: millions of drivers, each of whose positions changes every few seconds, and millions of "who is nearby?" queries per day, each needing an answer in tens of milliseconds. A full scan per query, or a band scan that touches millions of rows, is impossible. We need an index whose query cost depends on <strong>how many results are nearby</strong>, not on how many rows exist worldwide.</p>
+
+  <div class="callout interview">
+    <span class="callout-title">The one-sentence insight</span>
+    <p>"A B-tree sorts along one axis, but proximity is two-dimensional, so I'll use a geospatial index that partitions the map into cells; a query then examines only the few cells around the user instead of the whole world."</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>It appears whenever location is the main way users look for things:</p>
+  <ul>
+    <li><strong>Uber / Lyft:</strong> find available drivers near a rider. Locations change every few seconds.</li>
+    <li><strong>DoorDash / Uber Eats / GoPuff:</strong> find restaurants or the warehouse that can serve an address; then find couriers near the pickup.</li>
+    <li><strong>Yelp / Google Maps places:</strong> "restaurants within 2 miles", usually combined with category, rating and "open now". Places rarely move.</li>
+    <li><strong>Tinder / Bumble / Nextdoor:</strong> people within N km. Positions are semi-static and privacy-sensitive.</li>
+    <li><strong>Airbnb / Zillow / real-estate map search:</strong> listings inside the visible map rectangle (a bounding-box query, not a circle).</li>
+    <li><strong>Store locators, ATM finders, EV charger maps, geofencing, "weather alerts for my area".</strong></li>
+  </ul>
+  <p>Two flavors are worth distinguishing early, because they lead to different designs:</p>
+  <ul>
+    <li><strong>Static or slowly changing places</strong> (restaurants, stores, listings): read-heavy, write rarely. Index once, cache aggressively.</li>
+    <li><strong>Highly dynamic objects</strong> (drivers, couriers, friends): write-heavy position updates plus read queries. The index has to absorb constant updates.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>As always, start with the cheapest approach that could work. The ladder below goes from "no index at all" to the cell systems used by Google and Uber. Every rung exists to answer one question: <em>how do I look at fewer candidates?</em></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Idea</th><th>Reach for it when…</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>Brute force or bounding box + haversine</td><td>Compute exact distance, optionally prefilter with a lat/lon box</td><td>Up to thousands (maybe low hundreds of thousands, with a plain index) of rows</td><td>Linear scan; box still reads a latitude band</td></tr>
+        <tr><td>1</td><td>Grid / geohash</td><td>Fixed-size cells; a cell id (string prefix) is an ordinary indexed column</td><td>You want a simple, portable solution in any database</td><td>Boundary problem, uneven density, cell shape varies with latitude</td></tr>
+        <tr><td>2</td><td>Quadtree / R-tree</td><td>Recursive subdivision or nested bounding rectangles that adapt to density</td><td>Data is clustered (cities vs countryside), or you need polygons and rich queries</td><td>More complex to build and update; quadtree is usually in memory</td></tr>
+        <tr><td>3</td><td>Google S2 / Uber H3</td><td>Hierarchical cells on a sphere, with 64-bit ids and multiple resolutions</td><td>Global scale, many resolutions, analytics, regional covering</td><td>Library dependency; mental model takes time</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="step">Step 0</span>Brute force, or bounding box plus exact distance</h3>
+  <p>Do not underestimate this. If you have a few thousand rows, compute the distance to every one and sort. The work is trivial and there is nothing to build or maintain. Even for larger tables, a cheap <strong>bounding-box prefilter</strong> can reduce what you must compute exactly.</p>
+
+  <h4>Degrees are not distances</h4>
+  <p>Latitude and longitude are angles, not meters, and the conversion is not uniform:</p>
+  <ul>
+    <li>One degree of <strong>latitude</strong> is about <strong>111 km</strong> everywhere (about 69 miles).</li>
+    <li>One degree of <strong>longitude</strong> is about 111 km <em>times cos(latitude)</em>: roughly 111 km at the equator, about 88 km at 37 degrees north (San Francisco), about 55 km at 60 degrees north, and zero at the poles, where all meridians meet.</li>
+  </ul>
+  <p>Consequently a "0.02 degree" box is a different physical shape in different places, and plain Euclidean distance on raw degrees is wrong. For a radius of <code>r</code> km around <code>(lat0, lon0)</code>, the box half-sizes are <code>dlat = r / 111</code> and <code>dlon = r / (111 * cos(lat0))</code>.</p>
+
+  <h4>The haversine formula</h4>
+  <p>The great-circle distance between two points on a sphere (the shortest path over the surface) is given by the <strong>haversine formula</strong>, where phi is latitude, lambda is longitude (both in radians) and <code>R</code> is Earth's radius, about 6,371 km:</p>
+<pre><code>a = sin^2((phi2 - phi1) / 2)
+    + cos(phi1) * cos(phi2) * sin^2((lambda2 - lambda1) / 2)
+d = 2 * R * asin( sqrt(a) )</code></pre>
+  <p>Treating the Earth as a perfect sphere introduces an error of up to roughly 0.3 percent compared with the true ellipsoid, which is irrelevant for "nearby" features. (PostGIS <code>geography</code> uses a spheroid for more accuracy; Redis uses a haversine variant.)</p>
+
+  <h4>In SQL</h4>
+<pre><code>-- :dlat = r / 111.0      :dlon = r / (111.0 * cos(radians(:lat)))   (computed in the app)
+SELECT id, name,
+       2 * 6371 * asin(sqrt(
+         power(sin(radians(lat - :lat) / 2), 2) +
+         cos(radians(:lat)) * cos(radians(lat)) *
+         power(sin(radians(lon - :lon) / 2), 2)
+       )) AS km
+FROM   places
+WHERE  lat BETWEEN :lat - :dlat AND :lat + :dlat   -- cheap prefilter
+  AND  lon BETWEEN :lon - :dlon AND :lon + :dlon
+ORDER  BY km
+LIMIT  20;</code></pre>
+  <p>An index on <code>lat</code> helps the prefilter, but as shown earlier it still reads a whole latitude band. At a few thousand rows this is instant. At tens of millions it is not, which is the signal to move up the ladder. Note also that a box that crosses longitude 180 (the antimeridian) must be split into two ranges.</p>
+
+  <h3><span class="step">Step 1</span>Grid and geohash</h3>
+  <p>The simplest spatial index is a <strong>grid</strong>: slice the map into fixed-size squares, and give every square an id. Store each item's cell id in an ordinary indexed column. To find things near a point, compute the point's cell id, look up that cell (and its neighbors), then filter by exact distance. Now a normal B-tree on <code>cell_id</code> does the heavy lifting, because "which cell?" is a one-dimensional equality lookup.</p>
+  <p><strong>Geohash</strong> is the best-known way to name grid cells, and it is hierarchical.</p>
+
+  <h4>How geohash works</h4>
+  <ol>
+    <li>Start with the whole world: latitude in [-90, 90], longitude in [-180, 180].</li>
+    <li>Repeatedly <strong>bisect</strong>, alternating between longitude and latitude (longitude first). Each bisection produces one bit: <code>1</code> if the point is in the upper half of the current range, <code>0</code> if in the lower half. The range then shrinks to that half.</li>
+    <li>The bits from both axes are <strong>interleaved</strong> (lon, lat, lon, lat, ...) into one bit string.</li>
+    <li>Every 5 bits are encoded as one character of a 32-symbol alphabet (base32: digits and lowercase letters, omitting <code>a, i, l, o</code>). The result is a short string such as <code>9q8yy</code>, which is roughly downtown San Francisco.</li>
+  </ol>
+  <p>Two properties make it useful:</p>
+  <ul>
+    <li><strong>A prefix is the containing cell.</strong> <code>9q8y</code> is a bigger cell that contains <code>9q8yy</code>, which contains <code>9q8yyk</code>. Each extra character divides the cell into 32 smaller ones (an 8 by 4 or 4 by 8 sub-grid).</li>
+    <li><strong>Longer string means smaller cell,</strong> i.e. higher precision. Approximate cell sizes (at the equator; cells get narrower in east-west width as you move toward the poles, and exact figures vary by source):</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Geohash length</th><th>Approx. cell size (width x height)</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td>4</td><td>~39 km x 20 km</td><td>City-region scale</td></tr>
+        <tr><td>5</td><td>~5 km x 5 km</td><td>Neighborhood-to-city search for a "within a few km" query</td></tr>
+        <tr><td>6</td><td>~1.2 km x 0.6 km</td><td>Walking-distance search, ride-sharing pickup zones</td></tr>
+        <tr><td>7</td><td>~150 m x 150 m</td><td>City block, fine-grained supply counts</td></tr>
+        <tr><td>8</td><td>~40 m x 20 m</td><td>Building-level</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Because the code is just a string, you can store it in any database and use a plain B-tree: <code>WHERE geohash LIKE '9q8yy%'</code> is a prefix range scan, which a B-tree handles well. You can also store several precisions (<code>gh4, gh5, gh6</code>) as separate columns and pick the one that matches the search radius.</p>
+
+  <h4>The boundary problem: why you need the neighbors</h4>
+  <p>A point near the edge of its cell can be very close to a point in the <em>adjacent</em> cell, yet share no useful prefix with it. Two people 10 meters apart on either side of a cell boundary can have totally different geohashes. The worse case is the major boundaries (the equator or the prime meridian), where neighboring cells differ in their very first character. So looking only at your own cell silently misses nearby results.</p>
+  <p>This is also a symptom of the <strong>Z-order discontinuity</strong>: geohash orders cells along a Z-shaped curve that sometimes jumps across the map. Closeness in string-prefix terms implies closeness in space, but <em>not the other way around</em>.</p>
+  <p>The standard remedy is: choose a cell size comparable to (or somewhat larger than) the search radius, then query <strong>your own cell plus its 8 neighbors</strong> (a 3 by 3 block), and finally <strong>filter the candidates by exact distance</strong>. The grid is a cheap candidate generator; the haversine check removes the corners that fall outside the true circle.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 300" role="img" aria-label="A geohash grid. The query point sits near the edge of its cell, so a dashed search circle spills into neighboring cells. A three by three block of cells around the point's cell is highlighted as the set to query.">
+      <rect class="n" x="30" y="20" width="64" height="64"/><text class="t-s" x="40" y="38">c</text>
+      <rect class="n" x="94" y="20" width="64" height="64"/><text class="t-s" x="104" y="38">f</text>
+      <rect class="n" x="158" y="20" width="64" height="64"/><text class="t-s" x="168" y="38">g</text>
+      <rect class="n" x="222" y="20" width="64" height="64"/><text class="t-s" x="232" y="38">u</text>
+      <rect class="n" x="286" y="20" width="64" height="64"/><text class="t-s" x="296" y="38">v</text>
+
+      <rect class="n" x="30" y="84" width="64" height="64"/><text class="t-s" x="40" y="102">9</text>
+      <rect class="n-a" x="94" y="84" width="64" height="64"/><text class="t-a" x="104" y="102">d</text>
+      <rect class="n-a" x="158" y="84" width="64" height="64"/><text class="t-a" x="168" y="102">e</text>
+      <rect class="n-a" x="222" y="84" width="64" height="64"/><text class="t-a" x="232" y="102">s</text>
+      <rect class="n" x="286" y="84" width="64" height="64"/><text class="t-s" x="296" y="102">t</text>
+
+      <rect class="n" x="30" y="148" width="64" height="64"/><text class="t-s" x="40" y="166">3</text>
+      <rect class="n-a" x="94" y="148" width="64" height="64"/><text class="t-a" x="104" y="166">6</text>
+      <rect class="n-g" x="158" y="148" width="64" height="64"/><text class="t-g" x="168" y="166">7</text>
+      <rect class="n-a" x="222" y="148" width="64" height="64"/><text class="t-a" x="232" y="166">k</text>
+      <rect class="n" x="286" y="148" width="64" height="64"/><text class="t-s" x="296" y="166">m</text>
+
+      <rect class="n" x="30" y="212" width="64" height="64"/><text class="t-s" x="40" y="230">1</text>
+      <rect class="n-a" x="94" y="212" width="64" height="64"/><text class="t-a" x="104" y="230">4</text>
+      <rect class="n-a" x="158" y="212" width="64" height="64"/><text class="t-a" x="168" y="230">5</text>
+      <rect class="n-a" x="222" y="212" width="64" height="64"/><text class="t-a" x="232" y="230">h</text>
+      <rect class="n" x="286" y="212" width="64" height="64"/><text class="t-s" x="296" y="230">j</text>
+
+      <circle class="l-b dash" cx="212" cy="196" r="32"/>
+      <circle class="n-b" cx="212" cy="196" r="4"/>
+
+      <text class="t" x="385" y="42">Cells share a geohash prefix</text>
+      <text class="t-s" x="385" y="64">Each letter is a child cell of one parent cell.</text>
+      <rect class="n-g" x="385" y="82" width="16" height="12" rx="2"/><text class="t-s" x="410" y="92">Cell containing the query point</text>
+      <rect class="n-a" x="385" y="102" width="16" height="12" rx="2"/><text class="t-s" x="410" y="112">Its 8 neighbors (also queried)</text>
+      <circle class="l-b dash" cx="393" cy="132" r="6"/><text class="t-s" x="410" y="136">Search radius: crosses into neighbors</text>
+      <text class="t" x="385" y="172">Query plan</text>
+      <text class="t-s" x="385" y="194">1. Encode the point to its cell id.</text>
+      <text class="t-s" x="385" y="212">2. Compute the 8 neighbor ids.</text>
+      <text class="t-s" x="385" y="230">3. Fetch the items in those 9 cells.</text>
+      <text class="t-s" x="385" y="248">4. Filter and sort by exact distance.</text>
+      <text class="t-s" x="385" y="268">Letters follow the real geohash layout.</text>
+    </svg>
+    <figcaption>The point sits near the edge of cell 7, so the circle reaches into cells 5, k and h. Querying the 3x3 block guarantees the circle is covered; the exact-distance filter trims the rest.</figcaption>
+  </figure>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Trivial to understand and implement</li>
+      <li>Works in any database, even a key-value store, with a normal index</li>
+      <li>Hierarchical: choose precision to match the radius</li>
+      <li>Cheap, constant-time insert and update (just recompute a string)</li>
+      <li>Easy to shard on (prefix = natural partition key)</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Boundary problem: you must query neighbors</li>
+      <li>Cells are rectangles whose real size changes with latitude, and distortion near the poles</li>
+      <li>Fixed cell size ignores density: a Manhattan cell is full, a Montana cell is empty</li>
+      <li>Prefix discontinuities; Z-order curve is not locality-perfect</li>
+      <li>Poor fit for polygons and non-point shapes</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 2</span>Quadtree and R-tree: adapt to density</h3>
+  <p>A uniform grid wastes effort. Manhattan has thousands of drivers per square kilometer; rural Montana has a few per thousand. A fixed cell size is either far too coarse downtown (huge candidate lists) or far too fine in the countryside (millions of empty cells). Tree-shaped indexes fix this by subdividing <strong>only where the data is dense</strong>.</p>
+
+  <h4>Quadtree</h4>
+  <p>A <strong>quadtree</strong> recursively splits a square region into four equal quadrants (NW, NE, SW, SE).</p>
+  <ol>
+    <li>Start with one node covering the whole area, which holds points directly.</li>
+    <li>Choose a <strong>capacity threshold</strong>, for example 50 points per leaf.</li>
+    <li>When inserting would push a leaf above capacity, <strong>split</strong> it into four children and redistribute its points.</li>
+    <li>Repeat. Crowded areas end up deep in the tree with small leaves; empty areas stay as large leaves.</li>
+    <li><strong>Query:</strong> start at the root and descend only into children whose rectangle intersects the search circle (or box). Collect points from the leaves reached, then filter by exact distance. To get the nearest K, visit nearer children first and prune any child farther away than the current K-th best.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 310" role="img" aria-label="Left: a square map recursively divided into quadrants, with the dense north-east quadrant divided more finely than the sparse regions. Right: the matching tree, where only the dense branch has further children.">
+      <rect class="n-g" x="20" y="20" width="260" height="260"/>
+      <rect class="n-w" x="150" y="20" width="130" height="130"/>
+      <rect class="n-g" x="150" y="20" width="65" height="65"/>
+      <rect class="n-g" x="215" y="20" width="65" height="65"/>
+      <rect class="n-g" x="215" y="85" width="65" height="65"/>
+      <rect class="n-b" x="150" y="85" width="65" height="65"/>
+      <line class="l" x1="150" y1="20" x2="150" y2="280"/>
+      <line class="l" x1="20" y1="150" x2="280" y2="150"/>
+      <line class="l" x1="215" y1="20" x2="215" y2="150"/>
+      <line class="l" x1="150" y1="85" x2="280" y2="85"/>
+      <line class="l" x1="182.5" y1="85" x2="182.5" y2="150"/>
+      <line class="l" x1="150" y1="117.5" x2="215" y2="117.5"/>
+
+      <circle class="n-a" cx="60" cy="60" r="3"/><circle class="n-a" cx="110" cy="105" r="3"/>
+      <circle class="n-a" cx="70" cy="215" r="3"/>
+      <circle class="n-a" cx="190" cy="215" r="3"/><circle class="n-a" cx="250" cy="250" r="3"/><circle class="n-a" cx="225" cy="175" r="3"/>
+      <circle class="n-a" cx="165" cy="35" r="3"/><circle class="n-a" cx="190" cy="60" r="3"/><circle class="n-a" cx="235" cy="40" r="3"/>
+      <circle class="n-a" cx="255" cy="70" r="3"/><circle class="n-a" cx="228" cy="68" r="3"/><circle class="n-a" cx="260" cy="120" r="3"/>
+      <circle class="n-a" cx="235" cy="105" r="3"/><circle class="n-a" cx="160" cy="97" r="3"/><circle class="n-a" cx="172" cy="108" r="3"/>
+      <circle class="n-a" cx="192" cy="96" r="3"/><circle class="n-a" cx="200" cy="130" r="3"/><circle class="n-a" cx="165" cy="130" r="3"/>
+      <circle class="n-a" cx="172" cy="138" r="3"/><circle class="n-a" cx="205" cy="105" r="3"/>
+      <text class="t-s t-mid" x="85" y="132">sparse: 1 big leaf</text>
+      <text class="t-s t-mid" x="85" y="270">sparse: 1 big leaf</text>
+
+      <rect class="n" x="465" y="20" width="90" height="30" rx="6"/><text class="t t-mid" x="510" y="40">Root (world)</text>
+      <line class="l" x1="510" y1="50" x2="380" y2="96"/>
+      <line class="l" x1="510" y1="50" x2="470" y2="96"/>
+      <line class="l" x1="510" y1="50" x2="580" y2="96"/>
+      <line class="l" x1="510" y1="50" x2="670" y2="96"/>
+      <rect class="n-g" x="345" y="96" width="70" height="30" rx="6"/><text class="t t-mid" x="380" y="116">NW leaf</text>
+      <rect class="n-w" x="435" y="96" width="70" height="30" rx="6"/><text class="t t-mid" x="470" y="116">NE (split)</text>
+      <rect class="n-g" x="545" y="96" width="70" height="30" rx="6"/><text class="t t-mid" x="580" y="116">SW leaf</text>
+      <rect class="n-g" x="635" y="96" width="70" height="30" rx="6"/><text class="t t-mid" x="670" y="116">SE leaf</text>
+      <line class="l" x1="470" y1="126" x2="395" y2="176"/>
+      <line class="l" x1="470" y1="126" x2="455" y2="176"/>
+      <line class="l" x1="470" y1="126" x2="515" y2="176"/>
+      <line class="l" x1="470" y1="126" x2="575" y2="176"/>
+      <rect class="n-g" x="370" y="176" width="50" height="28" rx="6"/><text class="t t-mid" x="395" y="195">NW</text>
+      <rect class="n-g" x="430" y="176" width="50" height="28" rx="6"/><text class="t t-mid" x="455" y="195">NE</text>
+      <rect class="n-b" x="490" y="176" width="50" height="28" rx="6"/><text class="t t-mid" x="515" y="195">SW</text>
+      <rect class="n-g" x="550" y="176" width="50" height="28" rx="6"/><text class="t t-mid" x="575" y="195">SE</text>
+      <text class="t-s t-mid" x="515" y="224">split again (still too dense)</text>
+      <text class="t-s" x="330" y="258">Leaf: holds up to a fixed capacity of points.</text>
+      <text class="t-s" x="330" y="278">Dense area: deeper tree, smaller cells.</text>
+      <text class="t-s" x="330" y="298">Query: descend only into quadrants that touch the circle.</text>
+    </svg>
+    <figcaption>A quadtree spends detail where the points are. Cell size follows density, unlike a uniform grid. (Quadrant colors match between the map and the tree.)</figcaption>
+  </figure>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>Adapts to density automatically; each leaf has a bounded number of points</li>
+      <li>Natural nearest-neighbor search with pruning</li>
+      <li>Simple, fast, and great as an in-memory structure</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Usually lives in application memory, not in a standard database; you must persist, rebuild and replicate it yourself</li>
+      <li>Moving objects require delete + insert, and heavy churn needs rebalancing or periodic rebuilds</li>
+      <li>Hard to distribute: a tree has one root, so you shard by region and keep one tree per shard</li>
+      <li>Can become deep and unbalanced with clustered data</li>
+    </ul></div>
+  </div>
+
+  <h4>R-tree and GiST: what databases actually use</h4>
+  <p>An <strong>R-tree</strong> is the disk-friendly cousin of the quadtree, and it is the structure behind PostGIS indexes. Instead of dividing space into fixed quadrants, it groups <em>nearby objects</em> into <strong>minimum bounding rectangles (MBRs)</strong>, then groups those rectangles into larger rectangles, and so on, forming a balanced tree shaped like a B-tree:</p>
+  <ul>
+    <li><strong>Leaf entries</strong> store the bounding box of each object (a point is a degenerate box; a polygon is its bounding box).</li>
+    <li><strong>Internal nodes</strong> store the box that encloses all their children, plus pointers.</li>
+    <li><strong>Search:</strong> start at the root and descend into every child whose rectangle intersects the query region. Unlike a quadtree, sibling rectangles <em>may overlap</em>, so a query can have to follow more than one branch.</li>
+    <li>Nodes are sized to fit disk pages, and insert, delete and node-splitting are handled incrementally, so it is a good fit for a transactional database.</li>
+  </ul>
+  <p>In PostgreSQL, <code>CREATE INDEX ... USING GIST (geom)</code> builds such an R-tree-style index via the <strong>GiST</strong> (Generalized Search Tree) framework. It supports points, lines and polygons, so you can ask "which delivery zone polygon contains this address?" as well as "what is within 2 km?". MySQL spatial indexes and SQLite's R*Tree module work on the same principle.</p>
+  <div class="callout tip">
+    <span class="callout-title">Quadtree vs R-tree in one line</span>
+    <p>A quadtree divides <em>space</em> (fixed quadrants, regardless of where the points are); an R-tree groups <em>objects</em> (rectangles that tightly wrap whatever is there). Quadtrees are simpler and in-memory; R-trees are balanced, disk-based and handle shapes.</p>
+  </div>
+
+  <h3><span class="step">Step 3</span>Google S2 and Uber H3: cells on a sphere</h3>
+  <p>Geohash treats latitude and longitude as a flat rectangle, which distorts badly near the poles and ignores that the Earth is a sphere. Two modern libraries solve this by building the cell system directly on the sphere. Both are <em>hierarchical grids with 64-bit integer ids</em>, and they are what large systems use when they need more than a database offers.</p>
+
+  <h4>S2 (Google)</h4>
+  <ul>
+    <li><strong>Structure:</strong> project the sphere onto the six faces of a cube, subdivide each face as a quadtree (up to 30 levels), and number the cells along a <strong>Hilbert space-filling curve</strong>. The smallest cells are around a square centimeter; level choice trades size for count.</li>
+    <li><strong>Cell id:</strong> a 64-bit integer. The Hilbert curve has much better locality than geohash's Z-order: cells that are close in id are close in space, with far fewer jumps. So a <em>region maps to a small number of contiguous id ranges</em>, which a plain sorted index (B-tree, LSM, Bigtable) scans efficiently.</li>
+    <li><strong>Covering:</strong> to search a region, S2's region coverer picks a small set of cells (possibly at mixed levels) that together cover it; you then query each cell's id range and filter exactly. The same idea works for circles, rectangles and polygons.</li>
+    <li>Used inside Google products, and historically underlies MongoDB's <code>2dsphere</code> indexes and several other systems.</li>
+  </ul>
+
+  <h4>H3 (Uber)</h4>
+  <ul>
+    <li><strong>Structure:</strong> the globe is tiled with <strong>hexagons</strong> (plus exactly 12 pentagons at each resolution, a topological necessity), at 16 resolutions (0 to 15). Each finer resolution subdivides a cell into about 7 children. Cell edge lengths range from thousands of kilometers at resolution 0 to well under a meter at 15; resolution 8 is on the order of a few hundred meters per edge and resolution 9 a bit over 100 meters (approximate figures).</li>
+    <li><strong>Cell id:</strong> a 64-bit integer. Neighbor and radius operations are library calls: <code>grid_disk(cell, k)</code> returns the cell plus all cells within k steps; <code>latlng_to_cell(lat, lng, res)</code> maps a point to its cell.</li>
+    <li><strong>Why hexagons?</strong> In a square grid a cell has 4 edge-neighbors at distance 1 but 4 corner-neighbors at distance about 1.41, so "neighbor" is ambiguous. Every hexagon has 6 neighbors, all <strong>equidistant from its center</strong> and all sharing an edge. That uniformity makes <em>"cells within k steps"</em> approximate a circle much better than a square block does, and it makes smoothing, gradients and "move to adjacent cell" logic simpler. Uber uses H3 for demand and supply aggregation, surge pricing, marketplace analytics and matching.</li>
+    <li><strong>Trade-off:</strong> hexagons do not nest perfectly (a child hexagon is not exactly contained in its parent), so hierarchy is approximate, and hex cells are more awkward for exact region containment than S2's strict squares.</li>
+  </ul>
+
+  <h3>Comparing the options</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Structure</th><th>How it is stored</th><th>Dynamic updates</th><th>Neighbor handling</th><th>Best for</th></tr></thead>
+      <tbody>
+        <tr><td>Geohash</td><td>Rectangular grid; base32 string, Z-order curve</td><td>String column with an ordinary B-tree, or a sorted set</td><td>Very cheap: recompute a string</td><td>Must query 8 neighbors; prefix discontinuities</td><td>Simple designs in any database, shard keys, quick prototypes</td></tr>
+        <tr><td>Quadtree</td><td>Adaptive recursive quadrants</td><td>In-memory tree, one per shard, with its own persistence</td><td>Fine for modest churn; heavy movement needs rebalance</td><td>Descend and prune; neighbors via tree traversal</td><td>Clustered data, in-memory matching services, interview whiteboards</td></tr>
+        <tr><td>R-tree / GiST</td><td>Balanced tree of bounding rectangles</td><td>Disk-based index inside the database</td><td>Good, transactional, incremental</td><td>Overlapping boxes; engine handles it</td><td>Rich geometry (polygons), SQL queries, moderate write rates</td></tr>
+        <tr><td>S2</td><td>Cube-on-sphere quadtree, Hilbert curve, 64-bit ids</td><td>Integer cell ids in any sorted store; ranges of ids</td><td>Cheap: recompute a cell id</td><td>Covering a region by cells; neighbors by library call</td><td>Global scale, mixed-level coverings, polygons, range scans</td></tr>
+        <tr><td>H3</td><td>Hexagonal hierarchy on a sphere, 64-bit ids</td><td>Integer cell ids as partition or sort keys</td><td>Cheap: recompute a cell id</td><td>Uniform: k-ring of equidistant neighbors</td><td>Aggregation, supply/demand analytics, radius approximations, ride-hailing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Putting it together: the real-world architecture</h3>
+  <p>Choosing between geohash, quadtree and S2 is the easy part. The architecture depends on <strong>how often locations change</strong>.</p>
+
+  <h3>Static places: Yelp, store locators, listings</h3>
+  <p>Restaurants open and close rarely, so the data is read-heavy and nearly write-free. This is the easy case.</p>
+  <ul>
+    <li><strong>Store it in a database with a built-in spatial index:</strong> PostgreSQL with PostGIS (GiST index), or Elasticsearch/OpenSearch with a <code>geo_point</code> field. Both give you distance filtering and sorting directly.</li>
+    <li><strong>Search plus filters:</strong> real queries are "Thai, open now, 4+ stars, within 2 miles, sorted by relevance". Elasticsearch is attractive because it combines a geo filter with text search, term filters and ranking in one request. In Postgres you combine the spatial predicate with ordinary column filters and indexes.</li>
+    <li><strong>Precompute and cache:</strong> because the data barely changes, you can precompute a cell-to-places mapping (for example place ids per geohash-6 or H3 cell), and cache popular area queries (a query at a coarse cell and category is shared by many users). See <a href="01-scaling-reads.html">Scaling Reads</a>. Snap the user's coordinates to a cell before building the cache key; otherwise every user has a unique key and the hit rate is zero.</li>
+    <li><strong>Scale reads</strong> with replicas; writes (a new restaurant) are trivial.</li>
+  </ul>
+
+<pre><code>-- PostGIS: a geography column + GiST index, then ST_DWithin
+CREATE EXTENSION IF NOT EXISTS postgis;
+ALTER TABLE places ADD COLUMN geog geography(Point, 4326);
+UPDATE places SET geog = ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography;  -- note: lon first
+CREATE INDEX idx_places_geog ON places USING GIST (geog);
+
+SELECT id, name,
+       ST_Distance(geog, ST_SetSRID(ST_MakePoint(-122.4194, 37.7749), 4326)::geography) AS meters
+FROM   places
+WHERE  ST_DWithin(geog, ST_SetSRID(ST_MakePoint(-122.4194, 37.7749), 4326)::geography, 3200)  -- meters, about 2 miles
+  AND  category = 'thai' AND is_open
+ORDER  BY meters
+LIMIT  20;</code></pre>
+  <p>Two details worth knowing: with the <code>geography</code> type, distances are in <strong>meters</strong> on a spheroid, and <code>ST_DWithin</code> is index-aware (it first uses the GiST index on bounding boxes, then checks exact distance). The older <code>ST_Distance(...) &lt; r</code> form cannot use the index. PostGIS takes coordinates as <code>(longitude, latitude)</code>, x then y, which trips up many people.</p>
+
+  <h3>Highly dynamic locations: Uber drivers</h3>
+  <p>Now the points move. Each driver app sends a location ping every few seconds. Only the <em>latest</em> position matters to matching; old positions are history for a different system.</p>
+
+  <h4>The write volume</h4>
+  <p>A hedged back-of-envelope: 1 million online drivers pinging every 4 seconds is 1,000,000 / 4 = <strong>about 250,000 location writes per second</strong> (peak-hour global numbers will differ). That is far beyond what you want to push through a transactional relational database with a disk-based spatial index, where every update rewrites index entries. It is, however, comfortable for in-memory stores spread across a number of shards.</p>
+
+  <h4>Design</h4>
+  <ul>
+    <li><strong>Keep only the latest position, in memory.</strong> Use Redis geo commands (<code>GEOADD</code> overwrites a member's position), or your own <code>cell_id -> set of driver ids</code> map plus <code>driver_id -> (cell_id, lat, lon, timestamp)</code>. When a driver moves, you compute their new cell; if it equals the old cell, just update the coordinates; if not, remove from the old cell's set and add to the new one.</li>
+    <li><strong>Expire stale drivers.</strong> If a phone loses signal or the app is killed, the driver must disappear from results. Attach a timestamp to each ping and treat anything older than, say, 10 to 30 seconds as gone. Redis geo sets (which are sorted sets) have no per-member TTL, so common patterns are a per-cell key with an expiry that is refreshed by each ping, or a companion sorted set scored by last-seen time that a background job trims.</li>
+    <li><strong>Shard by geography.</strong> Positions in different cities never interact, so partition by city, region or top-level cell (an H3 or geohash prefix). Each shard handles a fraction of the writes and holds a small index. This is exactly the "partition by a natural key" idea from <a href="02-scaling-writes.html">Scaling Writes</a>.</li>
+    <li><strong>Reduce the write rate.</strong> Batch pings from the same gateway, send updates only when the driver has moved more than some distance, slow down the ping rate when idle or stationary, and drop out-of-order pings. These are the batching and write-reduction tactics from <a href="02-scaling-writes.html">Scaling Writes</a>.</li>
+    <li><strong>Separate history from the live index.</strong> Stream every ping into a log (Kafka) for trip reconstruction, analytics and ML, with a consumer that updates the live index. Matching reads from the in-memory index only.</li>
+    <li><strong>Durability is optional.</strong> The live index is rebuildable: if a shard restarts, drivers re-ping within seconds. Do not pay for strong durability on data that is obsolete in 5 seconds.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 770 245" role="img" aria-label="Architecture for a ride-sharing proximity service. Driver apps send pings to a location API which writes to a sharded in-memory geo store. A rider request goes to a matching service which queries the geo store for nearby drivers and then asks a routing service for ETAs.">
+      <rect class="n" x="5" y="30" width="110" height="54" rx="8"/><text class="t t-mid" x="60" y="62">Driver apps</text>
+      <rect class="n-a" x="195" y="30" width="130" height="54" rx="8"/><text class="t t-mid" x="260" y="62">Location API</text>
+      <rect class="n-g" x="405" y="30" width="170" height="54" rx="8"/><text class="t t-mid" x="490" y="52">In-memory geo store</text><text class="t-s t-mid" x="490" y="71">sharded by city / cell, TTL</text>
+      <line class="l-a" x1="115" y1="57" x2="193" y2="57" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="154" y="49">ping / 4s</text>
+      <line class="l-a" x1="325" y1="57" x2="403" y2="57" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="364" y="49">GEOADD</text>
+
+      <rect class="n" x="5" y="130" width="110" height="54" rx="8"/><text class="t t-mid" x="60" y="162">Rider app</text>
+      <rect class="n-a" x="195" y="130" width="130" height="54" rx="8"/><text class="t t-mid" x="260" y="162">Matching service</text>
+      <rect class="n-w" x="455" y="130" width="170" height="54" rx="8"/><text class="t t-mid" x="540" y="152">Routing / ETA engine</text><text class="t-s t-mid" x="540" y="171">road network, traffic</text>
+      <line class="l" x1="115" y1="157" x2="193" y2="157" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="154" y="149">request</text>
+      <line class="l-g" x1="310" y1="130" x2="430" y2="86" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="260" y="112">GEOSEARCH radius</text>
+      <line class="l" x1="325" y1="157" x2="453" y2="157" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="389" y="149">top-N drivers</text>
+
+      <text class="t-s" x="5" y="212">1. Cheap straight-line search finds nearby candidates; 2. the routing engine re-ranks the top N by real road ETA.</text>
+      <text class="t-s" x="5" y="231">Pings also stream to a log (Kafka) for history and analytics, outside the matching path.</text>
+    </svg>
+    <figcaption>Live matching reads the in-memory index. Distance filtering finds candidates; ETA ranking decides the winner.</figcaption>
+  </figure>
+
+<pre><code># Redis: store and query live driver positions (Redis 6.2+ for GEOSEARCH)
+GEOADD drivers:sf  -122.4194 37.7749  driver:42      # longitude first, then latitude
+GEOADD drivers:sf  -122.4101 37.7810  driver:77
+
+GEOSEARCH drivers:sf  FROMLONLAT -122.4180 37.7760  BYRADIUS 2 km  ASC  COUNT 20  WITHDIST
+
+# Redis stores each member in a sorted set, using a 52-bit geohash as the score.
+# One key per city/region gives you sharding and bounded key sizes.</code></pre>
+
+  <h3>Ranking, filters, radius and pagination</h3>
+  <ul>
+    <li><strong>Distance is not ETA.</strong> The nearest driver in a straight line may be across a river, on the other side of a one-way street or stuck in traffic. The usual pattern is two-phase: a fast geo query returns the nearest N (say 20 to 50) candidates, then a <strong>routing engine</strong> (OSRM, Valhalla, Google or Mapbox matrix APIs, or an in-house service) computes real driving ETAs for just those, and you rank by ETA (plus other signals like rating or acceptance rate). Do not call the routing engine for every driver in the city.</li>
+    <li><strong>Combine with filters.</strong> Filter on category, "open now", rating, price, vehicle type. In Elasticsearch you put the geo clause and the filters in one <code>bool</code> query. In a cell-based design you fetch candidates from the cells and apply the filters in memory, or keep a separate index per filter value for the most common cases (for example one geo set per vehicle type).</li>
+    <li><strong>Radius expansion.</strong> If the 3x3 block yields too few results (or none), widen the search: add the next ring of cells, or move up one precision level, and repeat up to a maximum radius. This is a loop, not a single query: start tight for low latency and expand only when needed.</li>
+    <li><strong>Pagination.</strong> "Page 2 of results by distance" over a moving set is tricky. For static places use a cursor of <code>(distance, id)</code> so ties are stable. For drivers, nobody pages; take the top N and stop.</li>
+  </ul>
+
+  <h3>Edge cases</h3>
+  <ul>
+    <li><strong>Dense city centers.</strong> A single geohash-6 cell may hold thousands of points. Use a finer precision there (or a quadtree/H3 at a finer resolution). Adaptive structures were invented for this.</li>
+    <li><strong>Shard boundaries.</strong> If you shard by city or cell, a rider at the edge of one shard is near drivers in the next. Query the neighbor shards too (the same "own cell plus neighbors" logic, one level up), or assign points near a boundary to both shards.</li>
+    <li><strong>Antimeridian and poles.</strong> Longitude wraps at plus or minus 180 degrees, so a naive "lon between a and b" box splits into two ranges near Fiji and the Aleutians. Near the poles longitude lines converge and rectangular cells become very distorted. S2 and H3 handle both cleanly; hand-rolled geohash code often does not. (Most products simply do not operate there.)</li>
+    <li><strong>GPS noise and staleness.</strong> Positions are accurate to several meters at best and can jump. Do not trust a position older than your TTL.</li>
+    <li><strong>Privacy.</strong> Precise location is sensitive personal data. Show riders a fuzzed or rounded driver position until pickup, do not expose exact coordinates of other users in dating and social apps (round to a cell or return only a distance bucket such as "2 km away"), limit retention of history, and lock down access to the location store.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>The interesting questions are not "which tree" but what each choice costs you.</p>
+
+  <h3>Cell size is a precision versus work trade-off</h3>
+  <p>Large cells mean few cells to look up but many candidates to filter; small cells mean tight candidate sets but many cells to cover a given radius (and more empty lookups). A rule of thumb for grid designs: pick a cell about the size of the typical search radius, so the 3x3 block covers the circle with a modest amount of waste. If radii vary a lot (500 m to 50 km), store several resolutions, or use S2 or H3 where changing the level is built in.</p>
+
+  <h3>Candidates then exact filter: two-phase queries</h3>
+  <p>Every approach in this page is a <strong>filter-then-refine</strong> pipeline. The index returns a superset (the cells' contents); you then compute exact distance and discard false positives. Forgetting the refine step returns results that are "in the right cells" but outside the radius, especially at the corners of the 3x3 block.</p>
+
+  <h3>Write amplification and index churn</h3>
+  <p>A disk-based spatial index (PostGIS GiST, MySQL spatial) pays for every update: it must remove the old entry and insert a new one, potentially splitting pages. At a few writes per second per object across millions of objects, that is the bottleneck, not the search. This is why live-moving data usually sits in memory, and the durable database holds only the slow-changing facts.</p>
+
+  <h3>Hot cells</h3>
+  <p>An airport, a stadium after a concert, or a city center on New Year's Eve concentrates both queries and writes into one cell, and thus one shard. Mitigate with finer cells at hot spots, splitting a hot shard by sub-cell, caching results with a short TTL, and, for supply counting, approximate or sampled counts rather than exact lists.</p>
+
+  <h3>Consistency of the moving index</h3>
+  <p>The index is always slightly behind reality: a driver may have accepted another trip or driven away since their last ping. Matching therefore has to <strong>confirm availability</strong> at the moment of assignment (see <a href="03-contention.html">Dealing with Contention</a>, which covers claiming a driver so two riders do not get the same one). Treat the geo index as a hint, not the truth.</p>
+
+  <h3>Cross-shard queries</h3>
+  <p>Sharding by region is great until the query sits on a boundary. Handle it by also querying adjacent shards for riders within one search radius of the boundary. Pick shard boundaries where little traffic crosses them (along rivers, mountains, sparsely populated areas), not through the middle of a city.</p>
+
+  <h3>Choosing the structure</h3>
+  <ul>
+    <li>Need SQL plus polygons plus transactions: <strong>PostGIS</strong> (R-tree/GiST).</li>
+    <li>Need geo plus text search and filters: <strong>Elasticsearch/OpenSearch</strong>.</li>
+    <li>Need fast, simple, in-memory moving points: <strong>Redis geo</strong> or a cell-to-set map.</li>
+    <li>Need to partition a huge key-value store by location: <strong>geohash or H3 cell as a partition key</strong>.</li>
+    <li>Need global scale with multiple resolutions: <strong>S2 or H3</strong>.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technology</th><th>Spatial mechanism</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>PostgreSQL + PostGIS</td><td>GiST (R-tree style) index on <code>geometry</code> / <code>geography</code>; <code>ST_DWithin</code>, <code>ST_Distance</code>, KNN ordering with <code>&lt;-&gt;</code></td><td>The default answer for static places with rich queries (polygons, containment, joins). Disk-based, transactional. Index maintenance makes extremely high-rate position updates expensive.</td></tr>
+        <tr><td>Redis geo commands</td><td>Sorted set with a 52-bit geohash score; <code>GEOADD</code>, <code>GEOSEARCH</code>, <code>GEODIST</code></td><td>In-memory and fast; ideal for the latest position of moving objects. Members only, no per-member TTL or attributes (keep those in a separate hash). Shard by region using multiple keys or a cluster. Limited to points and circle/box queries.</td></tr>
+        <tr><td>Elasticsearch / OpenSearch</td><td><code>geo_point</code> and <code>geo_shape</code> fields; <code>geo_distance</code>, <code>geo_bounding_box</code>, <code>geo_polygon</code> queries; sort by distance</td><td>Best when geo is combined with full-text, facets and ranking ("open Thai near me"). Near-real-time indexing (refresh interval) means it is not the right place for per-second driver pings.</td></tr>
+        <tr><td>MongoDB</td><td><code>2dsphere</code> index (S2-based), <code>$near</code>, <code>$geoWithin</code>, <code>$geoIntersects</code></td><td>Convenient if you already use Mongo; GeoJSON data; supports points and polygons.</td></tr>
+        <tr><td>DynamoDB</td><td>No native geo index; use a geohash or H3 cell as the partition key (with a sort key for refinement)</td><td>Query the 9 neighbor cells in parallel and filter. Watch hot partitions for dense cells. Libraries exist (for example geo-helper packages) but you own the logic.</td></tr>
+        <tr><td>Cassandra / ScyllaDB</td><td>Geohash or H3 cell as the partition key, entity id as the clustering key</td><td>Excellent write throughput for location data and time-series of positions; geo queries are cell lookups you assemble yourself.</td></tr>
+        <tr><td>MySQL / MariaDB</td><td>Spatial indexes (R-tree) on <code>POINT</code> / <code>GEOMETRY</code> columns; <code>ST_Distance_Sphere</code>, <code>MBRContains</code></td><td>Works for moderate data; spatial functions are less rich than PostGIS and the index helps mainly with bounding-box predicates.</td></tr>
+        <tr><td>Google S2 and Uber H3 libraries</td><td>Cell-id computation, coverings, neighbor lookups (bindings for C++, Java, Go, Python, JavaScript and more)</td><td>Not databases; they turn locations into integer cell ids you store in whatever database you like. Choose these when you want to control the partitioning yourself or run analytics by cell.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <ul>
+    <li><strong>Small data sets.</strong> With a few thousand rows (a thousand restaurants, a few hundred store locations) a plain scan with a haversine calculation is microseconds to a few milliseconds and needs no index. Building and maintaining a spatial index is extra complexity and, at this size, can even be slower than just scanning memory. Measure before adding it.</li>
+    <li><strong>Don't build your own geo index.</strong> Writing a quadtree or a geohash library for production is a trap: boundary bugs, antimeridian and pole cases, precision errors and rebalancing are all solved problems. Use PostGIS, Redis, Elasticsearch, S2 or H3. Whiteboarding a quadtree to explain <em>how it works</em> is great; proposing to run a custom one is not.</li>
+    <li><strong>The question is not spatial.</strong> "All stores in the state of California" or "orders from the Berlin region" is a plain equality or foreign-key lookup (store a region id). You do not need geometry to filter by an administrative area.</li>
+    <li><strong>The bottleneck is elsewhere.</strong> If the real problem is a huge volume of pings, that is a write-scaling problem first (see <a href="02-scaling-writes.html">Scaling Writes</a>); if it is repeated identical area searches, that is a caching problem (<a href="01-scaling-reads.html">Scaling Reads</a>).</li>
+    <li><strong>You need exact route distance for every candidate.</strong> Geo indexes give straight-line distance. Road-network distance needs a routing engine; do not try to emulate it with cells.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"Finding nearby drivers is a two-dimensional query, and a normal B-tree only sorts along one axis, so a latitude range gives me a band around the whole planet. I need a geospatial index. I'd divide the map into cells, using geohash, H3 or S2, so a query takes the rider's cell plus its neighbors and then filters by exact distance. I wouldn't build that myself. For places like restaurants, which rarely change, I'd use PostGIS or Elasticsearch with a geo index and cache popular area queries. Drivers are different: with a million drivers pinging every four seconds that is about 250K writes per second, so I'd keep only the latest position in memory in something like Redis, sharded by city, with a TTL so stale drivers drop out. A geo search returns the nearest few dozen candidates, then a routing service ranks them by real ETA. And if we only had a thousand rows, I'd skip the index and scan."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>Why can't I just put a composite index on (lat, lon)?</summary>
+    <div class="answer">
+      <p>A composite B-tree sorts by latitude first and only uses longitude to break ties between <em>identical</em> latitudes, which almost never happen with real coordinates. A range predicate on the first column can seek, but the second column then just filters. So the index narrows latitude to a band that wraps around the globe, and the database still scans every row in that band. A spatial index (R-tree, or a cell id from geohash, S2 or H3) maps two dimensions onto something searchable so both axes narrow at once.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Explain the geohash boundary problem and how you solve it.</summary>
+    <div class="answer">
+      <p>Two points either side of a cell boundary can be a few meters apart yet have different geohashes, sometimes differing from the first character (the equator, the prime meridian). A query that looks only at the user's own cell misses them. The fix is to query the user's cell plus its 8 neighbors, with cells at least as large as the search radius, and then compute the exact distance to filter the candidates. The deeper cause is that the Z-order curve is not locality-preserving: prefix similarity implies closeness but not the reverse. S2's Hilbert curve reduces the discontinuities, and H3's hexagons make "the neighbors" uniform.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Geohash, quadtree, R-tree, S2, H3: when would you pick each?</summary>
+    <div class="answer">
+      <p><strong>Geohash</strong> when you need something trivial that works in any database or key-value store and you can live with neighbor queries. <strong>Quadtree</strong> for an in-memory matching service where density varies a lot and you can hold one tree per shard. <strong>R-tree/GiST</strong> when you want it inside a transactional SQL database with polygons and rich queries, which is just PostGIS. <strong>S2</strong> for global, multi-resolution, region-covering workloads and range scans over integer ids. <strong>H3</strong> when you care about uniform neighbors, aggregation and analytics (surge pricing, supply/demand heatmaps) with hexagon cells. In an interview, the key is to explain the trade-off and then say "I'd use the one my database provides".</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Drivers ping every 4 seconds. How do you design the location store?</summary>
+    <div class="answer">
+      <p>Compute the load first: 1M drivers / 4s is about 250K writes per second. Keep only the latest position, in memory (Redis geo or a custom cell-to-driver map), shard by city or top-level cell so each shard handles a fraction, and give entries a short TTL so offline drivers vanish. Reduce traffic by batching at gateways and by sending pings only on meaningful movement. Stream all pings to a log for history and analytics separately. The index is reconstructible from the next round of pings, so it does not need heavy durability. Matching reads from the index, then confirms availability atomically when it assigns a driver.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Nearest by distance is not the best driver. What do you do?</summary>
+    <div class="answer">
+      <p>Use the geo index only to generate candidates (the nearest 20 to 50 by straight line), then call a routing engine for road-network ETA on that short list and rank by ETA, adjusted for factors like acceptance rate or vehicle type. This keeps the expensive routing calls to a handful per request. If the candidate list is too small (few drivers nearby), expand the search ring and repeat up to a maximum radius.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>A user searches near a shard boundary or the antimeridian. What breaks?</summary>
+    <div class="answer">
+      <p>Near a shard boundary, relevant points live on the neighboring shard, so you must query adjacent shards (or duplicate boundary points into both). Near longitude 180 a naive "lon between a and b" bounding box wraps around, so it must be split into two ranges; geohash-based neighbor code can also break there, whereas S2 and H3 are defined on the sphere and handle the wrap-around. Near the poles, rectangular cells become distorted and longitude shrinks to zero, which is again a reason to prefer sphere-native cell systems if you ever need such regions.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="01-scaling-reads.html">01 · Scaling Reads (caching popular area queries)</a></li>
+    <li><a href="02-scaling-writes.html">02 · Scaling Writes (sharding by region, batching pings)</a></li>
+    <li><a href="06-real-time-updates.html">06 · Real-Time Updates (live driver position on a map)</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>

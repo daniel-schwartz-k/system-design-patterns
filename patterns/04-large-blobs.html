@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handling Large Blobs — System Design Patterns</title>
+<meta name="description" content="How to move multi-gigabyte files in and out of your system without melting your API servers: object storage, pre-signed URLs, multipart and resumable uploads, CDN downloads, and keeping metadata and blobs consistent.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="04" data-root="../">
+<div class="shell">
+<main>
+<div class="content">
+
+<header class="hero">
+  <span class="eyebrow">Pattern 04 of 08</span>
+  <h1>Handling Large Blobs</h1>
+  <p class="lede">Photos, videos and documents are too big to push through your API servers. Let clients talk to object storage directly using short-lived signed URLs, upload in resumable chunks, serve downloads from a CDN, and let the storage system, not the client, tell you when a file has really landed.</p>
+  <div class="meta">
+    <span class="chip">Object storage</span>
+    <span class="chip">Pre-signed URLs</span>
+    <span class="chip">Multipart uploads</span>
+    <span class="chip">CDN</span>
+    <span class="chip">Metadata consistency</span>
+  </div>
+</header>
+
+<section>
+  <h2 id="tldr">TL;DR</h2>
+  <p>Uploading a 4 GB video to YouTube is the same problem as uploading a large file to Dropbox or Google Drive. If every byte flows through your application servers, those servers become expensive, slow, fragile file relays. The fix has a standard shape. Work through it in this order:</p>
+  <ol>
+    <li><strong>Store the bytes in object storage</strong> (S3, GCS, Azure Blob), not in your database and not on app-server disks. Keep only <em>metadata</em> (owner, name, size, status, storage key) in the database.</li>
+    <li><strong>Take the app servers out of the data path.</strong> The server hands the client a <strong>pre-signed URL</strong>: a short-lived, narrowly scoped permission to write one specific object directly into the bucket. The client uploads straight to storage.</li>
+    <li><strong>Upload in chunks</strong> (S3 multipart upload, GCS resumable sessions, the tus protocol) so big files upload in parallel and a dropped connection costs you one chunk, not the whole file.</li>
+    <li><strong>Let storage tell you when the object landed.</strong> Use an event notification (S3 to SQS/SNS/Lambda) to flip the database row from <code>pending</code> to <code>uploaded</code>. Do not trust the client to report success.</li>
+    <li><strong>Serve downloads through a CDN</strong> with signed URLs or cookies, keeping the bucket itself private.</li>
+  </ol>
+  <p>The part interviewers probe hardest is the last-mile consistency: your database and the blob store are now <em>two systems that must agree</em>, and any gap between them (client vanishes, event is lost, event arrives twice) must have a designed answer.</p>
+
+  <div class="callout recognize">
+    <span class="callout-title">Recognize it when…</span>
+    <ul>
+      <li>Users upload or download photos, videos, audio, documents, backups or datasets (YouTube, Dropbox, Google Drive, Instagram, Slack file sharing, a medical imaging archive).</li>
+      <li>The prompt says "large files", "gigabytes", "videos", "resumable", or "flaky mobile connection".</li>
+      <li>You catch yourself drawing an arrow from the client, through an API server, into storage. That arrow is the smell.</li>
+      <li>A feature needs both searchable metadata (title, owner, tags) and big opaque payloads in the same flow.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2 id="problem">The problem</h2>
+  <p>The obvious first design is <code>POST /videos</code> with the file as the request body. The API server receives the bytes, perhaps validates them, and writes them to storage. For a 200 KB avatar that is perfectly reasonable. For a 4 GB video it breaks in several independent ways:</p>
+  <ul>
+    <li><strong>Bandwidth is doubled.</strong> Every byte enters your server from the client, then leaves again towards storage. 1,000 simultaneous uploads at a modest 20 Mbps each is about 20 Gbps of ingress <em>and</em> 20 Gbps of egress through machines you pay for and must scale, just to relay data.</li>
+    <li><strong>Connections are held for a long time.</strong> At 20 Mbps, 4 GiB takes roughly half an hour. During that time one worker thread, socket or event-loop slot is pinned to one user. A fleet sized for fast request/response traffic (milliseconds per request) is suddenly sized by slow uploads.</li>
+    <li><strong>Memory and disk pressure.</strong> Servers must either stream carefully or buffer, and buffering gigabytes to memory or temp disk per request does not scale. A few large uploads can starve ordinary API calls on the same box.</li>
+    <li><strong>Intermediaries have limits.</strong> Reverse proxies, load balancers and API gateways commonly enforce request-size caps and idle or total timeouts (for example nginx defaults to a 1 MB body limit, an AWS ALB idle timeout defaults to 60 s, API Gateway caps payloads around 10 MB and Lambda synchronous payloads around 6 MB; check current limits). A single long HTTP request across all of these is fragile.</li>
+    <li><strong>Any failure restarts everything.</strong> A single HTTP request is all-or-nothing. If hotel Wi-Fi drops at 3.9 GB, the user begins again from byte zero. Retries also re-consume all that bandwidth.</li>
+    <li><strong>Scaling cost is coupled to the wrong thing.</strong> You would scale your stateless API tier by gigabits of file traffic instead of by request rate, which is far more expensive.</li>
+  </ul>
+
+  <h3>Why object storage, and why not the database</h3>
+  <p>Blobs belong in <strong>object storage</strong>: S3, Google Cloud Storage or Azure Blob Storage. Know how it differs from what you already use:</p>
+  <ul>
+    <li><strong>Flat namespace.</strong> A bucket holds objects addressed by a key string like <code>uploads/u42/9f3c.mp4</code>. The slashes are just characters; there are no real directories or inodes.</li>
+    <li><strong>Immutable objects.</strong> You write a whole object or replace it entirely. You cannot append or edit bytes in place the way you would with a file. (Versioning can keep old copies.)</li>
+    <li><strong>Very durable and cheap.</strong> Providers advertise about eleven nines (99.999999999%) of annual durability by spreading data across multiple devices and facilities. Storage is cheap per GB, and capacity is effectively unlimited. You pay for requests and data egress.</li>
+    <li><strong>An HTTP API, not a filesystem.</strong> PUT, GET, HEAD, DELETE, list-by-prefix, and range reads. This is exactly why clients can talk to it directly over the internet.</li>
+    <li><strong>Strongly consistent</strong> for reads after writes on S3 (since late 2020), so once a PUT returns success, a GET sees it. Other providers offer comparable guarantees; confirm for the one you pick.</li>
+  </ul>
+  <p>Storing blobs inside a relational database is almost always the wrong call at this scale. It bloats rows and tables, evicts hot index and data pages from the buffer pool, slows backups and replication (every replica now copies gigabytes), makes the database the bandwidth bottleneck, and costs far more per GB than object storage. There is no native CDN integration either. (Very small blobs, such as tiny thumbnails under a few hundred KB, are sometimes kept in the database for convenience, but that is the exception.) The standard split is: <strong>database holds metadata and a pointer; object storage holds bytes.</strong></p>
+
+  <div class="callout interview">
+    <span class="callout-title">Do the math out loud</span>
+    <p>Say the numbers: "If 1M users upload a 100 MB video per day, that is 100 TB/day of ingress, about 1.2 GB/s on average. I do not want that going through my API fleet. I want it going straight to object storage, which is built to absorb it." Then note that metadata is tiny by comparison (a few hundred bytes per file), which is why the database stays small and fast.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="when">When it comes up</h2>
+  <p>Any design where users move files or media of non-trivial size:</p>
+  <ul>
+    <li><strong>YouTube / Netflix / TikTok</strong>: upload a source video, then process it into many renditions and stream segments from a CDN.</li>
+    <li><strong>Dropbox / Google Drive / OneDrive</strong>: large files, resumable sync, deduplication, sharing links.</li>
+    <li><strong>Instagram / Pinterest / Flickr</strong>: photos uploaded, thumbnailed, served at huge read volume.</li>
+    <li><strong>Slack / email attachments / chat apps</strong>: user files with virus scanning and access control.</li>
+    <li><strong>Ticketing, medical and enterprise systems</strong>: PDFs, scans, exports and backups.</li>
+    <li>Any "<em>and the user can attach a file</em>" requirement hiding inside another design. Spot it and spend two minutes on this pattern.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="solutions">Solutions, in escalation order</h2>
+  <p>Start with the naive design so you can explain precisely what is wrong with it, then layer on the fixes. Each step solves a specific failure of the step before it.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Technique</th><th>Solves</th><th>New problem it creates</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>Proxy bytes through app servers</td><td>Simplest possible; fine for tiny files</td><td>Bandwidth, held connections, timeouts, all-or-nothing</td></tr>
+        <tr><td>1</td><td>Pre-signed URL, direct to object storage</td><td>App servers leave the data path</td><td>DB and blob store can disagree; signed URL is a bearer token</td></tr>
+        <tr><td>2</td><td>Multipart / resumable / chunked upload</td><td>Flaky networks, very large files, parallel speed-up</td><td>Chunk bookkeeping, orphaned incomplete uploads</td></tr>
+        <tr><td>3</td><td>Storage events + status state machine</td><td>Consistency between metadata and blob</td><td>At-least-once events, missed events, cleanup jobs</td></tr>
+        <tr><td>4</td><td>CDN with signed URLs for downloads</td><td>Fast global reads, private bucket, offloads origin</td><td>Invalidation, key rotation, signing logic</td></tr>
+        <tr><td>5</td><td>Acceleration and deduplication</td><td>Long-distance speed, repeated content</td><td>Extra complexity; only worth it at scale</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="step">Step 0</span>The naive approach: proxy through the app server</h3>
+  <p>The client sends the file to your API, which writes it to disk or to S3. Mention it, name its flaws (above), and say when it is acceptable: small files (a few MB at most, such as avatars or short documents), low volume, or a prototype. Even then, enforce a hard size limit at the edge. Beyond that, you need to move the bytes off your servers.</p>
+
+  <h3><span class="step">Step 1</span>Pre-signed URLs: let the client upload straight to storage</h3>
+  <p>The key insight is to separate the <strong>control plane</strong> (who may upload what; small JSON through your API) from the <strong>data plane</strong> (the bytes; straight to storage). Your server authenticates and authorizes the user, decides the object key, and then <em>signs</em> a URL granting temporary permission to perform one operation on that one key.</p>
+
+  <h4>What a pre-signed URL actually is</h4>
+  <p>It is an ordinary storage URL with extra query parameters carrying: the credential identity that signed it, a timestamp, an <strong>expiry</strong>, the list of signed headers, and a <strong>signature</strong>. The signature is an HMAC (AWS Signature V4 uses HMAC-SHA256) computed over a canonical description of the request: HTTP method, bucket and key, expiry, and any signed headers such as <code>Content-Type</code>. The secret key never leaves your server. When the request arrives, S3 recomputes the signature and checks that it matches, that the URL has not expired, and that the signing identity still has permission. Change any signed detail (a different key, method or content type) and the signature fails. Your app servers are not involved at all at upload time.</p>
+  <p>Properties to be able to state precisely:</p>
+  <ul>
+    <li><strong>Scoped:</strong> one bucket, one key, one HTTP method (PUT to upload, GET to download).</li>
+    <li><strong>Short-lived:</strong> typically minutes (say 5 to 15) for uploads. The maximum is bounded by the signer: up to 7 days with long-lived IAM user credentials in SigV4, but no longer than the session lifetime when signed with temporary credentials (for example an assumed role or a Lambda role).</li>
+    <li><strong>A bearer token:</strong> anyone holding the URL can use it until it expires. No further login is checked at storage. Treat it like a password: never log it, keep the TTL short, serve it only over HTTPS.</li>
+    <li><strong>The server picks the key.</strong> Never let the client choose the object key or path (collisions, overwriting other users' files, path tricks). Use something like <code>uploads/{userId}/{uploadId}</code> with a random <code>uploadId</code>.</li>
+  </ul>
+
+  <h4>PUT vs POST policy: enforcing size and type</h4>
+  <p>A signed <strong>PUT</strong> URL is simple, but it cannot enforce a <em>range</em> of acceptable sizes. You can sign the exact <code>Content-Length</code> (the client must then send exactly that many bytes) and the <code>Content-Type</code>. A pre-signed <strong>POST</strong> (browser form upload with a signed <em>policy document</em>) supports conditions such as <code>content-length-range</code> (min and max bytes), required key prefixes, and exact or prefix-matched content types. Use POST when you need server-enforced size limits on a single-request upload, or validate and cap sizes at the application layer when you issue multipart URLs (you declared the size up front and you control the number of parts you sign). A single PUT or POST to S3 is limited to 5 GiB; anything larger must use multipart.</p>
+
+<pre><code># Python / boto3: issue upload permission (server side)
+import boto3, uuid
+from botocore.config import Config
+
+s3 = boto3.client("s3", config=Config(signature_version="s3v4"))
+upload_id = str(uuid.uuid4())
+key = f"uploads/{user_id}/{upload_id}"        # server chooses the key
+
+# Option A: presigned PUT (can pin Content-Type, cannot cap a size range)
+put_url = s3.generate_presigned_url(
+    "put_object",
+    Params={"Bucket": "acme-media", "Key": key, "ContentType": "video/mp4"},
+    ExpiresIn=900,                              # 15 minutes
+)
+# Client MUST send header Content-Type: video/mp4 or the signature fails.
+
+# Option B: presigned POST (can enforce a size range via the policy)
+post = s3.generate_presigned_post(
+    Bucket="acme-media", Key=key,
+    Fields={"Content-Type": "video/mp4"},
+    Conditions=[
+        ["content-length-range", 1, 5 * 1024**3],     # 1 byte .. 5 GiB
+        ["eq", "$Content-Type", "video/mp4"],
+    ],
+    ExpiresIn=900,
+)
+# Client sends multipart/form-data using post["url"] and post["fields"].
+
+# Limits worth remembering:
+#  - single PUT/POST object max is 5 GiB; larger needs multipart upload
+#  - bucket CORS must allow the browser origin and PUT/POST + headers
+#  - signing is local CPU work; it makes no network call to S3
+#  - URL expiry is bounded by the credentials that signed it</code></pre>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 500" role="img" aria-label="Sequence diagram of a pre-signed upload: the client asks the API, the API records a pending row and returns a signed URL, the client uploads straight to S3, S3 emits an event to a worker which marks the row uploaded then ready, and the client polls status">
+      <rect class="n" x="30" y="6" width="100" height="30" rx="6"/><text class="t t-mid" x="80" y="26">Client</text>
+      <rect class="n" x="200" y="6" width="100" height="30" rx="6"/><text class="t t-mid" x="250" y="26">API server</text>
+      <rect class="n-g" x="360" y="6" width="100" height="30" rx="6"/><text class="t t-mid" x="410" y="26">Database</text>
+      <rect class="n-a" x="520" y="6" width="100" height="30" rx="6"/><text class="t t-mid" x="570" y="26">S3 bucket</text>
+      <rect class="n-w" x="660" y="6" width="100" height="30" rx="6"/><text class="t t-mid" x="710" y="26">Worker</text>
+      <line class="l dash" x1="80" y1="36" x2="80" y2="488"/>
+      <line class="l dash" x1="250" y1="36" x2="250" y2="488"/>
+      <line class="l dash" x1="410" y1="36" x2="410" y2="488"/>
+      <line class="l dash" x1="570" y1="36" x2="570" y2="488"/>
+      <line class="l dash" x1="710" y1="36" x2="710" y2="488"/>
+
+      <line class="l-a" x1="80" y1="72" x2="246" y2="72" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="163" y="64">1. POST /uploads</text>
+      <line class="l-a" x1="250" y1="102" x2="406" y2="102" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="330" y="94">2. row: pending</text>
+      <line class="l-a" x1="246" y1="132" x2="84" y2="132" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="165" y="124">3. signed URL</text>
+
+      <line class="l-g" x1="80" y1="184" x2="566" y2="184" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="330" y="176">4. PUT bytes (chunks)</text>
+      <text class="t-s t-mid" x="330" y="202">never touches the API</text>
+      <line class="l" x1="566" y1="230" x2="84" y2="230" marker-end="url(#arrow)"/>
+      <text class="t-s t-mid" x="330" y="222">5. 200 OK + ETag</text>
+
+      <line class="l-a" x1="570" y1="280" x2="706" y2="280" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="638" y="272">6. ObjectCreated</text>
+      <line class="l-a" x1="710" y1="318" x2="414" y2="318" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="490" y="310">7. status = uploaded</text>
+
+      <rect class="n-w" x="620" y="338" width="150" height="46" rx="6"/>
+      <text class="t-s t-mid" x="695" y="358">scan, thumbnails,</text>
+      <text class="t-s t-mid" x="695" y="374">transcode</text>
+      <line class="l-a" x1="710" y1="414" x2="414" y2="414" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="490" y="406">8. status = ready</text>
+
+      <line class="l-a" x1="80" y1="450" x2="246" y2="450" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="163" y="442">9. GET status</text>
+      <line class="l-a" x1="246" y1="478" x2="84" y2="478" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="165" y="470">10. ready</text>
+    </svg>
+    <figcaption>The pre-signed upload flow. Steps 1 to 3 are the control plane; step 4 is the data plane; steps 6 to 8 are the feedback loop that makes the database trustworthy.</figcaption>
+  </figure>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>API servers handle only tiny JSON requests</li>
+      <li>Upload throughput scales with the storage service, not your fleet</li>
+      <li>No per-request memory, disk or long-held connections on your tier</li>
+      <li>Permissions stay narrow, auditable and expiring</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>Database and storage are now two sources of truth</li>
+      <li>Signed URL leakage grants write access until expiry</li>
+      <li>Needs bucket CORS and a client that can speak to storage</li>
+      <li>Validation (size, type, content) moves to after upload or into policies</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 2</span>Multipart and resumable uploads</h3>
+  <p>One PUT is still all-or-nothing, and it caps at 5 GiB. For big files, split them into <strong>parts</strong>, upload each independently (and in parallel), and ask storage to stitch them together at the end. The benefits are the ones the video called out: if the connection drops, only the in-flight part is lost; the client retries that one part and carries on.</p>
+
+  <h4>How S3 multipart upload works</h4>
+  <ol>
+    <li><strong>Initiate.</strong> <code>CreateMultipartUpload</code> returns an <code>UploadId</code>.</li>
+    <li><strong>Upload parts.</strong> Each part is sent with <code>UploadPart</code>, tagged with a <code>PartNumber</code> (1 to 10,000) and the <code>UploadId</code>. Each response returns an <code>ETag</code> you must remember.</li>
+    <li><strong>Complete.</strong> <code>CompleteMultipartUpload</code> with the ordered list of <code>(PartNumber, ETag)</code> pairs. S3 assembles the final object, and only then does the object become visible.</li>
+    <li><strong>Or abort.</strong> <code>AbortMultipartUpload</code> frees the parts. Until you abort or complete, the uploaded parts sit invisibly in the bucket and <em>you are billed for storing them</em>.</li>
+  </ol>
+  <p>Limits to remember (S3; confirm current values): each part is <strong>5 MiB to 5 GiB</strong> (the last part may be smaller than 5 MiB), at most <strong>10,000 parts</strong>, for a maximum object size of <strong>5 TiB</strong>. Part size choice is a trade-off: small parts mean cheaper retries and finer-grained progress but more requests and hit the 10,000-part ceiling sooner (a 100 GiB file needs parts of at least ~10 MiB); large parts mean fewer requests but more wasted work on a failure. 8 to 64 MiB is a common range, and clients usually pick the part size from the file size.</p>
+  <p>With pre-signed URLs, the server initiates the multipart upload and then signs one URL <em>per part</em> (<code>upload_part</code> with <code>UploadId</code> and <code>PartNumber</code>), or the client asks the server for batches of part URLs as it goes. Completion should ideally be done by <strong>your server</strong> (or a trusted worker) so that you control the final part list.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 320" role="img" aria-label="A 4 GiB file split into 8 parts of 512 MiB: three parts uploaded, one failed and retried alone, two in flight in parallel, two queued, then CompleteMultipartUpload assembles the object in S3">
+      <rect class="n" x="40" y="14" width="700" height="38" rx="8"/>
+      <text class="t t-mid" x="390" y="38">video.mp4 (4 GiB) split into 8 parts of 512 MiB (illustrative; real clients often use 8 to 64 MiB)</text>
+
+      <rect class="n-g" x="40" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="80" y="102">Part 1</text><text class="t-s t-mid" x="80" y="122">ETag saved</text>
+      <rect class="n-g" x="127.5" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="167.5" y="102">Part 2</text><text class="t-s t-mid" x="167.5" y="122">ETag saved</text>
+      <rect class="n-g" x="215" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="255" y="102">Part 3</text><text class="t-s t-mid" x="255" y="122">ETag saved</text>
+      <rect class="n-b" x="302.5" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="342.5" y="102">Part 4</text><text class="t-s t-mid" x="342.5" y="122">failed</text>
+      <rect class="n-a" x="390" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="430" y="102">Part 5</text><text class="t-s t-mid" x="430" y="122">in flight</text>
+      <rect class="n-a" x="477.5" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="517.5" y="102">Part 6</text><text class="t-s t-mid" x="517.5" y="122">in flight</text>
+      <rect class="n" x="565" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="605" y="102">Part 7</text><text class="t-s t-mid" x="605" y="122">queued</text>
+      <rect class="n" x="652.5" y="80" width="80" height="54" rx="8"/><text class="t t-mid" x="692.5" y="102">Part 8</text><text class="t-s t-mid" x="692.5" y="122">queued</text>
+
+      <line class="l" x1="80" y1="52" x2="80" y2="78"/>
+      <line class="l" x1="342" y1="52" x2="342" y2="78"/>
+      <line class="l" x1="692" y1="52" x2="692" y2="78"/>
+
+      <text class="t-g t-mid" x="167" y="158">done, safe in S3</text>
+      <text class="t-b t-mid" x="342" y="176">retry only this part</text>
+      <text class="t-a t-mid" x="474" y="158">uploaded in parallel</text>
+      <text class="t-s t-mid" x="648" y="158">waiting for a free slot</text>
+
+      <line class="l-a" x1="390" y1="196" x2="390" y2="238" marker-end="url(#arrow)"/>
+      <text class="t-a" x="402" y="222">CompleteMultipartUpload(UploadId, [(n, ETag), ...])</text>
+
+      <rect class="n-a" x="40" y="242" width="700" height="46" rx="8"/>
+      <text class="t t-mid" x="390" y="270">S3 assembles one object. Parts are invisible and billed until Complete or Abort.</text>
+      <text class="t-s" x="40" y="312">A lifecycle rule (AbortIncompleteMultipartUpload) deletes abandoned parts automatically.</text>
+    </svg>
+    <figcaption>Multipart upload: parts upload independently and in parallel; a failure costs one part, and the object only appears when Complete succeeds.</figcaption>
+  </figure>
+
+  <h4>Resumability and client-side bookkeeping</h4>
+  <p>Resuming means the client must know <em>which parts already made it</em>. Two sources of truth, and the second is safer:</p>
+  <ul>
+    <li><strong>Client-side state:</strong> persist <code>UploadId</code>, file fingerprint (name, size, last-modified, maybe a hash of the first chunk) and the completed <code>(PartNumber, ETag)</code> list in <code>localStorage</code>/IndexedDB or on disk. Cheap, but breaks if the user switches device or clears storage.</li>
+    <li><strong>Ask storage:</strong> call <code>ListParts(UploadId)</code> (via your server) to learn exactly what S3 holds, then upload only the missing parts. This is authoritative and survives client crashes. The server can also store <code>UploadId</code> in the metadata row so any device can resume.</li>
+  </ul>
+  <p>The same ideas exist elsewhere under different names:</p>
+  <ul>
+    <li><strong>Google Cloud Storage resumable uploads:</strong> you initiate a session and get a unique session URI. You send bytes in chunks (multiples of 256 KiB) with a <code>Content-Range</code> header. After an interruption you query the session URI for how many bytes were persisted and resume from that offset. Sessions last on the order of a week.</li>
+    <li><strong>Azure Blob:</strong> <code>Put Block</code> for each block, then <code>Put Block List</code> to commit, with SAS tokens as the pre-signed equivalent.</li>
+    <li><strong>tus protocol:</strong> an open HTTP-based resumable upload standard. The client creates an upload, <code>HEAD</code>s it to learn the current <code>Upload-Offset</code>, then <code>PATCH</code>es from that offset. Server implementations (tusd) can sit in front of S3, and client libraries like Uppy support tus and S3 multipart.</li>
+  </ul>
+
+  <h4>Integrity: checksums</h4>
+  <p>Networks and bugs corrupt bytes, and you want to catch it before declaring success. Send a checksum with each part: <code>Content-MD5</code> (classic) or the newer <code>x-amz-checksum-sha256</code>/<code>crc32c</code> headers, and S3 rejects a part that does not match so the client simply re-sends it. Remember that for multipart objects the final <strong>ETag is not the MD5 of the file</strong> (it is a hash of the part hashes with a <code>-N</code> suffix), so do not use it as a content hash. If you need an end-to-end file hash (for dedup or verification), compute SHA-256 on the client and store it in metadata, or use S3's additional checksum support.</p>
+
+  <div class="proscons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>A dropped connection costs one part, not the whole file</li>
+      <li>Parallel parts saturate fast links and finish sooner</li>
+      <li>Supports files far beyond the single-request limit (up to 5 TiB on S3)</li>
+      <li>Per-part checksums catch corruption early</li>
+      <li>Pausable and resumable across sessions</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>More client logic (chunking, retries, progress, concurrency)</li>
+      <li>Many more signed URLs and requests to manage and pay for</li>
+      <li>Incomplete uploads leave billable orphan parts unless cleaned up</li>
+      <li>You must choose and tune part size</li>
+    </ul></div>
+  </div>
+
+  <h3><span class="step">Step 3</span>Keep metadata and blob consistent: let storage tell you</h3>
+  <p>Now the subtle part. You have two systems: your database (a <code>files</code> row) and the bucket (an object). No transaction spans both. Things that can go wrong:</p>
+  <ul>
+    <li>The upload <strong>succeeds</strong> in S3, but your row still says <code>pending</code> (the client never called back, or called a crashed server).</li>
+    <li>The row says <code>uploaded</code>, but the object is <strong>missing</strong> or incomplete (a lying or buggy client reported success).</li>
+    <li>The client <strong>vanishes halfway</strong>, leaving a <code>pending</code> row and orphaned multipart parts forever.</li>
+    <li>An object exists in the bucket that <strong>no row points to</strong> (row creation failed after signing, or the row was deleted).</li>
+  </ul>
+
+  <h4>Why not trust the client to say "I'm done"?</h4>
+  <p>A client-driven <code>POST /uploads/{id}/complete</code> sounds natural but is unreliable: the app can be killed or lose connectivity between the last byte and the callback (so a finished upload stays <code>pending</code>), and a buggy or malicious client can claim success without uploading anything, or upload something different from what it declared. The only party that knows for certain that the bytes landed is the storage system itself.</p>
+
+  <h4>The usual answer: event notifications and a status state machine</h4>
+  <p>Create the row <em>before</em> issuing the URL with <code>status = pending</code>. Configure the bucket to emit an <strong>event notification</strong> (S3 <code>ObjectCreated:*</code>, including <code>CompleteMultipartUpload</code>) to SQS, SNS, EventBridge or a Lambda. A consumer looks up the row by the object key and moves it forward. Model it as a small state machine:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Status</th><th>Meaning</th><th>Moves on when</th></tr></thead>
+      <tbody>
+        <tr><td><code>pending</code></td><td>Row exists, URL issued, no bytes confirmed</td><td>S3 event arrives (or the row expires)</td></tr>
+        <tr><td><code>uploaded</code></td><td>Storage confirmed the object exists</td><td>Worker picks it up for processing</td></tr>
+        <tr><td><code>processing</code></td><td>Scanning, thumbnailing, transcoding</td><td>Worker finishes or fails</td></tr>
+        <tr><td><code>ready</code></td><td>Safe to show and download</td><td>Terminal (or deleted later)</td></tr>
+        <tr><td><code>failed</code> / <code>expired</code></td><td>Rejected, infected, or never completed</td><td>Cleanup job removes row and object</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Making the consumer robust</h4>
+  <ul>
+    <li><strong>At-least-once delivery, so be idempotent.</strong> S3 notifications can be delivered more than once and are not guaranteed to be ordered. Use a conditional update (<code>UPDATE files SET status='uploaded' WHERE id=? AND status='pending'</code>) so a duplicate event is a no-op, and dedupe on object key plus version or sequencer where needed.</li>
+    <li><strong>Verify, do not assume.</strong> The handler may <code>HeadObject</code> the key to confirm size and content type match what was declared, and reject or quarantine on mismatch.</li>
+    <li><strong>A reconciliation job covers missed events.</strong> Events are reliable but not perfect (misconfiguration, consumer bug, downstream outage). Periodically scan <code>pending</code> rows older than the URL TTL plus a margin: if <code>HeadObject</code> finds the object, mark it <code>uploaded</code> (event was lost); if not, mark it <code>expired</code> and delete. In the other direction, list the bucket (S3 Inventory is cheaper than listing at scale) to find <strong>orphan objects</strong> with no row.</li>
+    <li><strong>Lifecycle rules do the garbage collection.</strong> Configure <code>AbortIncompleteMultipartUpload</code> (for example after 1 to 7 days) and an expiration on a <code>tmp/</code> or <code>incoming/</code> prefix for unfinished uploads so abandoned data does not accumulate and bill you.</li>
+    <li><strong>Optionally also let the client call "complete".</strong> That gives faster UX (the UI can move on immediately), but the server should verify against storage rather than trust the claim, and the event remains the authoritative signal.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-title">Row first, URL second</span>
+    <p>Always insert the <code>pending</code> row before handing out the signed URL, never after. If you sign first and the insert then fails, the client can upload an object nobody knows about. If you insert first and signing fails, you merely have a harmless pending row that expires.</p>
+  </div>
+
+  <h3><span class="step">Step 4</span>Downloads: CDN with signed URLs</h3>
+  <p>Downloads go the same direction in reverse: keep bytes off your API tier. Once a file is <code>ready</code>, the API authorizes the user and returns a <strong>signed download URL</strong>; the client then fetches the bytes from a CDN (CloudFront, Cloudflare, Fastly, Cloud CDN) or, for rarely accessed private files, directly from S3 with a pre-signed GET. The CDN caches popular objects at the edge close to users and fetches from the bucket (the <em>origin</em>) only on a miss. See <a href="01-scaling-reads.html">Scaling Reads</a> for CDN caching mechanics.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 220" role="img" aria-label="Download path: the client asks the API for a signed CDN URL, then fetches from the CDN, which fetches from a private S3 bucket on a cache miss">
+      <rect class="n" x="20" y="20" width="110" height="52" rx="8"/><text class="t t-mid" x="75" y="51">Client</text>
+      <rect class="n-a" x="330" y="20" width="110" height="52" rx="8"/><text class="t t-mid" x="385" y="51">API server</text>
+      <rect class="n-a" x="330" y="130" width="110" height="52" rx="8"/><text class="t t-mid" x="385" y="161">CDN edge</text>
+      <rect class="n-g" x="620" y="130" width="140" height="52" rx="8"/><text class="t t-mid" x="690" y="161">S3 (private)</text>
+      <line class="l-a" x1="130" y1="38" x2="326" y2="38" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="228" y="30">1. GET /files/42</text>
+      <line class="l-a" x1="326" y1="60" x2="134" y2="60" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="228" y="80">2. signed CDN URL</text>
+      <line class="l" x1="75" y1="72" x2="75" y2="156"/>
+      <line class="l-a" x1="75" y1="156" x2="326" y2="156" marker-end="url(#arrow)"/>
+      <text class="t-a t-mid" x="200" y="148">3. GET signed URL</text>
+      <line class="l-g" x1="440" y1="156" x2="616" y2="156" marker-end="url(#arrow)"/>
+      <text class="t-g t-mid" x="528" y="148">4. on miss only</text>
+      <text class="t-s" x="20" y="208">Hit: served from the edge. The bucket stays private and only the CDN identity may read it.</text>
+    </svg>
+    <figcaption>Download path: authorization happens once at the API; the heavy bytes come from the edge.</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>Private vs public buckets.</strong> Truly public assets (marketing images, public avatars) can be served from a public or CDN-fronted bucket with long cache lifetimes and content-hashed names. Private user content should keep the bucket private and be reachable only through the CDN's identity (for CloudFront, Origin Access Control) plus signed URLs or signed cookies.</li>
+    <li><strong>Signed URLs vs signed cookies.</strong> A signed URL grants one object; signed cookies grant access to a set of objects (for example all segments of a video) without rewriting every URL.</li>
+    <li><strong>Range requests.</strong> HTTP <code>Range: bytes=...</code> returns <code>206 Partial Content</code>. Both S3 and CDNs support it, which enables resuming a download, seeking inside a video, and parallel segmented downloads. Resumable downloads need no special server logic.</li>
+    <li><strong>Streaming video.</strong> Rather than serving one huge MP4, transcode into many bitrates and cut into short segments (a few seconds each) listed in a manifest: <strong>HLS</strong> (<code>.m3u8</code>) or <strong>MPEG-DASH</strong>. The player fetches segments over plain HTTP from the CDN and switches bitrate to match bandwidth (adaptive bitrate). This is exactly why the post-upload processing step exists.</li>
+    <li><strong>Set the right headers.</strong> <code>Content-Type</code> so browsers behave, <code>Content-Disposition: attachment</code> to force downloads for untrusted file types, and appropriate <code>Cache-Control</code>.</li>
+    <li><strong>Short expiries and rotation.</strong> Signed download URLs for private content should expire quickly. For the CDN, the signing key pair is a secret that you rotate.</li>
+  </ul>
+
+  <h3><span class="step">Step 5</span>Post-processing, acceleration and deduplication</h3>
+  <ul>
+    <li><strong>Hand off processing to async workers.</strong> After the <code>ObjectCreated</code> event, enqueue jobs for virus scanning, thumbnails, metadata extraction, transcoding to HLS renditions, OCR, and so on. This work is slow and bursty, so it belongs on a queue with workers that retry, not in a request path. See <a href="05-long-running-tasks.html">Long-Running Tasks</a>, and <a href="07-multi-step-processes.html">Multi-Step Processes</a> when it becomes a multi-stage pipeline.</li>
+    <li><strong>Regional placement and transfer acceleration.</strong> Distance to the bucket hurts TCP throughput. Place buckets near your users, use multiple regions, or use S3 Transfer Acceleration (clients upload to the nearest edge location, which forwards over the provider's backbone). Treat it as a measured optimization, not a default.</li>
+    <li><strong>Deduplication by content hash.</strong> For Dropbox-style products, split files into fixed or content-defined chunks (a few MB each), hash each chunk (for example SHA-256), and store chunks keyed by hash. Before uploading, the client sends the list of hashes and the server replies with which are missing, so identical chunks are never uploaded or stored twice (across versions of a file, and across users, subject to privacy and security considerations). It makes re-sync and small edits cheap: only changed chunks move. The cost is extra metadata, reference counting for garbage collection, and a hash-oracle privacy risk if cross-user dedup is exposed naively.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="tradeoffs">Trade-offs &amp; pitfalls</h2>
+  <p>Each improvement trades something away. The failures below are the ones a good interviewer will push on.</p>
+
+  <h3>Two systems that must agree</h3>
+  <p>Covered above: use a state machine, row-first ordering, events as the source of "uploaded", idempotent consumers, a reconciliation sweeper and lifecycle rules. Be explicit that the guarantee you are providing is <em>eventual</em> consistency with detection and repair, not atomicity.</p>
+
+  <h3>Signed URL leakage and scope</h3>
+  <p>The URL is a bearer credential. Mitigate: short TTL, narrow scope (one key, one method, pinned content type), HTTPS only, never log full URLs (query strings often end up in access logs and analytics), and treat a leaked upload URL as the ability to overwrite that single key until it expires. Rotate or restrict the signing identity to a minimal IAM policy (only <code>s3:PutObject</code> on the upload prefix). For one-shot semantics, new keys per upload prevent overwriting existing objects, and versioning protects against accidental overwrite.</p>
+
+  <h3>Expiry vs very long uploads</h3>
+  <p>The URL must be valid when the request <em>starts</em>; a request already in progress at expiry generally continues, but a retry after expiry fails. For multipart, sign one short-lived URL per part (or batches of them) and let the client request fresh ones as needed, rather than one long-lived mega-URL.</p>
+
+  <h3>Untrusted content</h3>
+  <ul>
+    <li><strong>Do not trust the declared type.</strong> The client chooses <code>Content-Type</code> and file name. Verify by sniffing magic bytes server-side after upload, and re-encode media (a transcoded image is far safer than the original).</li>
+    <li><strong>Scan for malware.</strong> Common pattern: clients upload to an <code>incoming/</code> (quarantine) prefix or bucket, a worker scans (ClamAV or a managed scanner), then promotes clean files to the serving location. Nothing is downloadable until status is <code>ready</code>.</li>
+    <li><strong>Serve user content from a separate domain</strong> (for example <code>usercontent.example.com</code> or a distinct registrable domain), never your main one. Otherwise an uploaded HTML or SVG file executing in your origin can steal cookies or tokens (stored XSS). Add <code>Content-Disposition: attachment</code> and <code>X-Content-Type-Options: nosniff</code> for risky types.</li>
+    <li><strong>Quotas and rate limits.</strong> Enforce per-user storage quotas and limit how many upload sessions can be issued per user, since signing is cheap for you but storage and egress are not. Cap declared sizes at issuance time.</li>
+    <li><strong>Encrypt at rest</strong> (server-side encryption is default on most providers) and consider per-tenant keys for sensitive data.</li>
+  </ul>
+
+  <h3>Cost and operational gotchas</h3>
+  <ul>
+    <li><strong>Orphan parts are invisible and billed.</strong> Always add the abort-incomplete lifecycle rule.</li>
+    <li><strong>Request costs.</strong> Many small parts mean many PUT requests, each billed. Do not use a 1 MiB part size for 100 GiB files.</li>
+    <li><strong>Egress is usually the dominant cost for downloads.</strong> A CDN generally lowers it versus serving from the bucket, and lets you set long cache lifetimes.</li>
+    <li><strong>Browser CORS configuration</strong> on the bucket is a classic source of "it works in curl but not in the app" failures; allow the right origins, methods, and expose the <code>ETag</code> header so the client can read part ETags.</li>
+    <li><strong>Hot prefixes are largely a non-issue on modern S3</strong> (it scales request rates per prefix automatically), but random key prefixes (like a UUID) still avoid accidental hot spots and enumeration.</li>
+  </ul>
+
+  <h3>Progress and UX</h3>
+  <p>Direct uploads mean your server does not see progress. The client knows its own byte counts, and the server learns about completion from events. For multi-device or processing progress ("transcoding 40%"), push status to the client with polling, SSE or WebSockets. See <a href="06-real-time-updates.html">Real-Time Updates</a>.</p>
+</section>
+
+<section>
+  <h2 id="tech">Technology options</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Options</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Object storage</td><td>Amazon S3, Google Cloud Storage, Azure Blob Storage, Cloudflare R2, MinIO (self-hosted, S3-compatible)</td><td>All speak HTTP, support signed access and lifecycle rules. R2 has no egress fees; MinIO suits on-prem or local development.</td></tr>
+        <tr><td>Signed access</td><td>S3 pre-signed URL and POST policy, GCS signed URLs and resumable sessions, Azure SAS tokens</td><td>Same idea under different names: time-limited, scoped, HMAC- or key-signed.</td></tr>
+        <tr><td>Chunked / resumable protocols</td><td>S3 multipart, GCS resumable, Azure block blobs, tus (tusd)</td><td>tus is an open standard; Uppy and Resumable.js are common client libraries.</td></tr>
+        <tr><td>CDN</td><td>CloudFront, Cloudflare, Fastly, Akamai, Cloud CDN</td><td>Support signed URLs/cookies and origin access control to keep the bucket private.</td></tr>
+        <tr><td>Completion events</td><td>S3 Event Notifications to SQS, SNS, Lambda or EventBridge; GCS Pub/Sub notifications; Azure Event Grid</td><td>At-least-once; design idempotent consumers and a reconciliation job.</td></tr>
+        <tr><td>Metadata store</td><td>PostgreSQL / MySQL, DynamoDB</td><td>Holds owner, key, size, checksum, status, timestamps. Index by owner and status for sweeper queries.</td></tr>
+        <tr><td>Scanning and processing</td><td>ClamAV, managed scanners, ffmpeg workers, AWS Elemental MediaConvert, image resizers</td><td>Run on a queue with retries; quarantine prefix until clean.</td></tr>
+        <tr><td>Streaming formats</td><td>HLS, MPEG-DASH</td><td>Short segments plus manifest, adaptive bitrate, served from the CDN.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="not">When NOT to use it</h2>
+  <ul>
+    <li><strong>Small payloads.</strong> A 50 KB profile picture or a few-KB JSON blob does not justify pre-signed URL flows, events and sweepers. Accepting it via the API (with a strict size cap) is simpler and perfectly fine, as long as you cap sizes and do not allow it to grow into big files later.</li>
+    <li><strong>You need to inspect or transform bytes synchronously before accepting.</strong> If a request must be rejected immediately based on content, direct-to-storage pushes validation after the fact. A bounded API-side upload (small files) or a staged flow is better.</li>
+    <li><strong>Strong atomicity between metadata and blob is a hard requirement.</strong> Two systems cannot give you one transaction. If you truly need it for small items, consider storing them inside the database, or restructure so the database is the single source of truth and the blob is derivable.</li>
+    <li><strong>Frequently edited, in-place file content</strong> (random writes inside a file, database files, shared mutable documents). Object stores replace whole objects. Use a filesystem or block storage, or a collaborative editing model built for it.</li>
+    <li><strong>Low-latency small-record workloads.</strong> A key-value or relational store is the right home, not S3.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="script">Interview script</h2>
+  <div class="callout interview">
+    <span class="callout-title">Say it like this</span>
+    <blockquote>"I do not want a 4 GB upload going through my API servers: it doubles bandwidth, holds a connection for tens of minutes, and a single dropped connection restarts everything. So I will store the bytes in object storage like S3 and keep only metadata in the database. The client asks my API for an upload, I create a row with status pending and return a pre-signed URL scoped to one server-chosen key with a short expiry. For big files the client uses multipart upload: it sends parts in parallel, retries just the failed part, and can resume by asking S3 which parts it already has. The tricky bit is that the database and S3 now have to agree, so I do not trust the client to say it is done. Instead S3 emits an ObjectCreated event to a queue, an idempotent consumer flips the row to uploaded, and a worker scans and processes it before marking it ready. A sweeper reconciles stale pending rows, and lifecycle rules abort abandoned multipart uploads. Downloads go through a CDN with signed URLs over a private bucket, and for video I would transcode to HLS segments."</blockquote>
+  </div>
+</section>
+
+<section>
+  <h2 id="qa">Deep-dive Q&amp;A</h2>
+
+  <details class="qa"><summary>Why not just have the client tell us when the upload is finished?</summary>
+    <div class="answer">
+      <p>Because the client is the least reliable participant. The app may be killed between the last byte and the callback, leaving a finished upload stuck as <code>pending</code>. A buggy or malicious client may say "done" when nothing, or something different, was uploaded. The storage system is the only party that actually knows the object exists, so you subscribe to its event notification and update the database from that. A client "complete" call is still fine as a UX hint, as long as the server verifies it (for example with <code>HeadObject</code>) rather than believing it, and a sweeper repairs the cases where the event or callback never arrives.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>A user is uploading 4 GB on flaky hotel Wi-Fi. Walk through how it survives disconnects.</summary>
+    <div class="answer">
+      <p>The server initiates an S3 multipart upload and stores the <code>UploadId</code> in the metadata row. The client slices the file into parts (say 16 MiB), requests signed URLs for them, and uploads several in parallel, recording each returned ETag. If the network drops, in-flight parts fail and are retried with backoff; completed parts are safe in S3. After an app restart or a device change, the client asks the server for <code>ListParts</code> (or its saved state) to see which parts exist and uploads only the missing ones. When all parts are in, the server calls <code>CompleteMultipartUpload</code> with the ordered part list, S3 assembles the object, and the <code>ObjectCreated</code> event moves the row forward. Per-part checksums catch corrupted chunks, and an abort-incomplete lifecycle rule cleans up if the user never returns.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you stop someone from uploading 50 GB, or a malware executable, through a signed URL?</summary>
+    <div class="answer">
+      <p>Layer the controls. At issuance, the user declares file size and type and you enforce quotas and caps before signing anything. For single-request uploads use a pre-signed POST with <code>content-length-range</code> and an exact content type condition; for multipart, you control how many parts you sign and their sizes. The URL is scoped to one server-chosen key and expires quickly. After upload, verify size and sniffed type via <code>HeadObject</code> and the first bytes, then scan in a quarantine prefix and only promote clean files to <code>ready</code>. Serve user content from a separate domain with <code>nosniff</code> and attachment disposition so that even a bad file cannot run in your origin. Rate-limit upload sessions per user.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>The S3 event never arrives, or arrives twice. What happens?</summary>
+    <div class="answer">
+      <p>Duplicates are expected (at-least-once delivery), so the handler is idempotent: a conditional update <code>WHERE status='pending'</code> turns the second delivery into a no-op, and any downstream job is keyed by file id so it is not enqueued twice. Missed events are repaired by a reconciliation job that finds <code>pending</code> rows older than the URL TTL plus a margin and calls <code>HeadObject</code>: if the object exists the row advances (the event was lost), if not the row is expired and deleted. A dead-letter queue on the consumer captures poison messages for inspection. Periodically, S3 Inventory is compared against the table to find orphan objects without rows.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>How do you serve a private video securely and make it start fast?</summary>
+    <div class="answer">
+      <p>Keep the bucket private and put a CDN in front, granting the CDN (and only the CDN) read access through an origin access identity. When an authorized user opens the video, the API returns a signed URL, or sets signed cookies so one authorization covers every segment. The video itself was transcoded after upload into several bitrates and cut into short HLS or DASH segments plus a manifest, so playback begins after fetching just the first segment and the player adapts bitrate to bandwidth. Popular segments are cached at the edge so most requests never reach S3. Keep signed-URL lifetimes short and rotate the CDN signing key.</p>
+    </div>
+  </details>
+
+  <details class="qa"><summary>Why not store files in the database, or on a network file system?</summary>
+    <div class="answer">
+      <p>In a relational database, large values bloat tables, pollute the buffer pool, slow backups and replication, make the database the bandwidth bottleneck, and cost far more per GB, with no CDN integration. A network file system (NFS/EFS) gives you POSIX semantics you do not need, is pricier, scales less cheaply, and still routes bytes through your servers unless you build direct access. Object storage is built for exactly this: huge, immutable, cheap, durable, HTTP-addressable objects with signed access, lifecycle rules and event hooks. The one reason to reconsider is a very small, strongly-transactional blob where atomicity with a row matters more than scale.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="related">Related patterns</h2>
+  <ul class="related">
+    <li><a href="01-scaling-reads.html">01 · Scaling Reads (CDN)</a></li>
+    <li><a href="05-long-running-tasks.html">05 · Long-Running Tasks (post-upload processing)</a></li>
+    <li><a href="06-real-time-updates.html">06 · Real-Time Updates (upload progress)</a></li>
+    <li><a href="07-multi-step-processes.html">07 · Multi-Step Processes</a></li>
+  </ul>
+</section>
+
+<div class="pager" data-pager></div>
+
+</div>
+</main>
+</div>
+<script src="../assets/main.js"></script>
+</body>
+</html>
